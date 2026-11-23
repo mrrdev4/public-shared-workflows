@@ -505,7 +505,7 @@ jobs:
         needs.ctx.outputs.is_dev_flow == 'true' &&
         needs.ctx.result == 'success'
       }}
-    uses: mrrdev4/publlic-shared-workflows/.github/workflows/build-maven.yml@feature/add-deploy-vm-gcp
+    uses: mrrdev4/public-shared-workflows/.github/workflows/build-maven.yml@feature/add-deploy-vm-gcp
     with:
       runs_on: ${{ inputs.runs_on }}
       environment: ${{ inputs.environment_dev }}
@@ -534,7 +534,7 @@ jobs:
       max-parallel: 1
       matrix:
         vm: ${{ fromJson(needs.ctx.outputs.vms_dev) }}
-    uses: mrrdev4/publlic-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    uses: mrrdev4/public-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
     with:
       runs_on: >-
         ${{ matrix.vm == '__default__'
@@ -814,7 +814,7 @@ jobs:
       max-parallel: 1
       matrix:
         vm: ${{ fromJson(needs.ctx.outputs.vms_ti) }}
-    uses: mrrdev4/publlic-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    uses: mrrdev4/public-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
     with:
       runs_on: >-
         ${{ matrix.vm == '__default__'
@@ -848,7 +848,7 @@ jobs:
       max-parallel: 1
       matrix:
         vm: ${{ fromJson(needs.ctx.outputs.vms_trg) }}
-    uses: mrrdev4/publlic-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    uses: mrrdev4/public-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
     with:
       runs_on: >-
         ${{ matrix.vm == '__default__'
@@ -1155,7 +1155,7 @@ jobs:
         # Serve apenas para criar 1 job por VM (a lista vem de vars.VMS_PRD).
         # Os valores NÃO são usados como label de runner.
         vm: ${{ fromJson(needs.ctx.outputs.vms_prd) }}
-    uses: mrrdev4/publlic-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    uses: mrrdev4/public-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
     with:
       # Sempre usa o label de PRD vindo do caller (runs_on_prd), independente de matrix.vm.
       runs_on: ${{ inputs.runs_on_prd != '' && inputs.runs_on_prd || inputs.runs_on }}
