@@ -1,0 +1,64 @@
+name: Validate PR Structure 🔍
+
+on:
+  workflow_call: {}
+
+
+jobs:
+  LintPrTitle:
+    name: Check Conventional Commit ✅
+    runs-on: [ubuntu-latest]
+    steps:
+      - name: Validate PR Title uses Conventional Commit ✅
+        uses: amannn/action-semantic-pull-request@v5
+        with:
+          types: |
+            feat
+            feat!
+            fix
+            chore
+            docs
+            style
+            refactor
+            perf
+            test
+            ci
+            build
+            revert
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  ValidatePrBody:
+    name: Check PR Body Sections ✅
+    if: >-
+      ${{
+        github.event_name == 'pull_request' &&
+        !(
+          github.actor == 'dependabot[bot]' ||
+          startsWith(github.head_ref, 'dependabot/') ||
+          startsWith(github.head_ref, 'release-please--') ||
+          startsWith(github.head_ref, 'release/')
+        )
+      }}
+
+    runs-on: [Ubuntu-latest]
+    needs: LintPrTitle
+    steps:
+      - name: Ensure PR body contains required sections
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const body = context.payload.pull_request.body || "";
+            const requiredSections = [
+              "## 🔍 Descrição resumida",
+              "## 🎟️ Issue relacionada",
+              "## ✅ Checklist de mudanças",
+              "## 🧪 Cobertura de testes",
+              "## 🩹 Plano de rollback"
+            ];
+            const missing = requiredSections.filter(section => !body.includes(section));
+            if (missing.length > 0) {
+              core.setFailed(`❌ PR está faltando as seções obrigatórias:\n${missing.join("\n")}`);
+            } else {
+              core.info("✅ Todas as seções obrigatórias estão presentes.");
+            }

@@ -1,0 +1,216 @@
+name: Deploy VM GCP ⛵
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: "JSON do runs-on (string, lista ou objeto com group/labels)"
+        type: string
+        required: false
+        default: '{"group":"devops-sre","labels":["self-hosted","devops-sre-DEV"]}'
+
+      environment:
+        description: "GitHub Environment"
+        type: string
+        required: true
+
+      repository_url:
+        description: "URL do repositório Maven no GAR (output do build). Vazio => vars.GCP_MAVEN_REPOSITORY_URL"
+        type: string
+        required: false
+        default: ""
+
+      group_id:
+        description: "groupId do artefato publicado"
+        type: string
+        required: true
+
+      artifact_id:
+        description: "artifactId do artefato publicado"
+        type: string
+        required: true
+
+      artifact_version:
+        description: "Versão do artefato publicado ( não SNAPSHOT)"
+        type: string
+        required: true
+
+      gcp_workload_identity_provider:
+        description: "WIF provider. Vazio => vars.GCP_WIF_PROVIDER"
+        type: string
+        required: false
+        default: ""
+
+      gcp_service_account:
+        description: "Service Account para impersonar via WIF. Vazio => vars.GCP_SERVICE_ACCOUNT"
+        type: string
+        required: false
+        default: ""
+
+    outputs:
+      jar_path:
+        description: "Caminho do jar salvo na VM"
+        value: ${{ jobs.deploy.outputs.jar_path }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: Deploy VM GCP ⛵
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      APP_FOLDER: ${{ vars.APP_FOLDER }}
+      APP_NAME: ${{ vars.APP_NAME }}
+      APP_SERVICE_NAME: ${{ vars.APP_SERVICE_NAME }}
+
+    outputs:
+      jar_path: ${{ steps.download.outputs.jar_path }}
+
+    steps:
+      - name: Resolve GCP 📌
+        id: refs
+        env:
+          INPUT_URL: ${{ inputs.repository_url }}
+          V_GCP_MAVEN_REPOSITORY_URL: ${{ vars.GCP_MAVEN_REPOSITORY_URL }}
+          INPUT_WIF_PROVIDER: ${{ inputs.gcp_workload_identity_provider }}
+          V_GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          INPUT_GCP_SA: ${{ inputs.gcp_service_account }}
+          V_GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+
+          REPO_URL="${INPUT_URL:-${V_GCP_MAVEN_REPOSITORY_URL}}"
+          WIF_PROVIDER="${INPUT_WIF_PROVIDER:-${V_GCP_WIF_PROVIDER}}"
+          GCP_SA="${INPUT_GCP_SA:-${V_GCP_SERVICE_ACCOUNT}}"
+
+          : "${REPO_URL:?Defina inputs.repository_url ou vars.GCP_MAVEN_REPOSITORY_URL}"
+          : "${WIF_PROVIDER:?Defina inputs.gcp_workload_identity_provider ou vars.GCP_WIF_PROVIDER}"
+          : "${GCP_SA:?Defina inputs.gcp_service_account ou vars.GCP_SERVICE_ACCOUNT}"
+
+
+          # normaliza: aceita artifactregistry:// ou https://, sem barra final
+          REPO_URL="${REPO_URL#artifactregistry://}"
+          REPO_URL="${REPO_URL#https://}"
+          REPO_URL="https://${REPO_URL%/}"
+
+          echo "repository_url=${REPO_URL}" >> "$GITHUB_OUTPUT"
+          echo "gcp_wif_provider=${WIF_PROVIDER}" >> "$GITHUB_OUTPUT"
+          echo "gcp_service_account=${GCP_SA}" >> "$GITHUB_OUTPUT"
+
+      - name: Auth to Google Cloud
+        id: gcp_auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ steps.refs.outputs.gcp_wif_provider }}
+          service_account: ${{ steps.refs.outputs.gcp_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+
+      - name: Download Artifact from GAR 📦
+        id: download
+        env:
+          GCP_TOKEN: ${{ steps.gcp_auth.outputs.access_token }}
+          REPO_URL: ${{ steps.refs.outputs.repository_url }}
+          GROUP_ID: ${{ inputs.group_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          VERSION: ${{ inputs.artifact_version }}
+        run: |
+          set -euo pipefail
+
+          : "${GROUP_ID:?group_id vazio: o build não expôs as coordenadas do artefato}"
+          : "${ARTIFACT_ID:?artifact_id vazio}"
+          : "${VERSION:?artifact_version vazio}"
+          : "${APP_NAME:?Defina vars.APP_NAME no environment}"
+          : "${APP_FOLDER:?Defina vars.APP_FOLDER no environment}"
+          if [[ "${VERSION}" == *-SNAPSHOT ]]; then
+            echo "::error::Versão SNAPSHOT não é suportada por este download direto (${VERSION}). Use uma versão release."
+            exit 1
+          fi
+
+          GROUP_PATH="${GROUP_ID//./\/}"
+          SOURCE_NAME="${ARTIFACT_ID}-${VERSION}.jar"
+          URL="${REPO_URL}/${GROUP_PATH}/${ARTIFACT_ID}/${VERSION}/${SOURCE_NAME}"
+          DEST="${APP_FOLDER}/${APP_NAME}"
+
+          mkdir -p "${APP_FOLDER}"
+
+          TMP_FILE="$(mktemp "${APP_FOLDER}/.${APP_NAME}.XXXXXX")"
+          trap 'rm -f "${TMP_FILE}"' EXIT
+
+          echo "Downloading ${URL} ..."
+
+          curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 \
+            --config <(printf 'header = "Authorization: Bearer %s"\n' "${GCP_TOKEN}") \
+            -o "${TMP_FILE}" "${URL}"
+
+          if [[ ! -s "${TMP_FILE}" ]]; then
+            echo "::error::Download returned an empty file: ${URL}"
+            exit 1
+          fi
+
+          chmod 644 "${TMP_FILE}"
+          mv -f "${TMP_FILE}" "${DEST}"
+          trap - EXIT
+
+          echo "jar_path=${DEST}" >> "$GITHUB_OUTPUT"
+          ls -lh "${DEST}"
+
+      - name: Restart App Service 🔄
+        run: |
+          set -euo pipefail
+          : "${APP_SERVICE_NAME:?Defina vars.APP_SERVICE_NAME no environment}"
+          echo "Stopping ${APP_SERVICE_NAME} ..."
+          sudo -n systemctl stop "${APP_SERVICE_NAME}"
+
+          echo "Starting ... ${APP_SERVICE_NAME}"
+          sudo -n systemctl start "${APP_SERVICE_NAME}"
+
+      - name: Verify Service ✅
+        run: |
+          set -euo pipefail
+
+          state="unknown"
+          for _ in $(seq 1 30); do
+            state="$(systemctl is-active "${APP_SERVICE_NAME}" || true)"
+            [[ "${state}" == "active" ]] && break
+            sleep 2
+          done
+
+          if [[ "${state}" == "active" ]]; then
+            sleep 10
+            state="$(systemctl is-active "${APP_SERVICE_NAME}" || true)"
+          fi
+
+          if [[ "${state}" != "active" ]]; then
+            echo "::error::${APP_SERVICE_NAME} não está ativo (estado: ${state})"
+            systemctl status "${APP_SERVICE_NAME}" --no-pager -l || true
+            sudo -n journalctl -u "${APP_SERVICE_NAME}" -n 50 --no-pager || true
+            exit 1
+          fi
+
+          echo "✅ ${APP_SERVICE_NAME} is active!"
+          systemctl status "${APP_SERVICE_NAME}" --no-pager -n 15 || true
+
+      - name: Summary 📜
+        if: ${{ always() }}
+        env:
+          JAR_PATH: ${{ steps.download.outputs.jar_path }}
+          GROUP_ID: ${{ inputs.group_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          VERSION: ${{ inputs.artifact_version }}
+        run: |
+          {
+            echo "## Deploy VM GCP ⛵ - Summary"
+            echo ""
+            echo "- artefato: \`${GROUP_ID}:${ARTIFACT_ID}:${VERSION}\`"
+            echo "- destino: \`${JAR_PATH:-não baixado}\`"
+            echo "- serviço: \`${APP_SERVICE_NAME}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

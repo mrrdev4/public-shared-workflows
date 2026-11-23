@@ -1,0 +1,758 @@
+name: Deploy Helm OpenShift ⛵
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: "Runner labels (JSON array). Ex.: [\"self-hosted\",\"dev\"]"
+        required: false
+        type: string
+        default: '["self-hosted","dev"]'
+
+      environment:
+        description: "Ambiente do GitHub para o job (dev, ti, trg, prd)"
+        required: false
+        type: string
+        default: dev
+
+      checkout:
+        description: "Fazer checkout do repositório (necessário para chart local)"
+        required: false
+        type: boolean
+        default: true
+
+      release:
+        description: "Nome do release Helm (se vazio, usa o nome do repositório, sanitizado)"
+        required: false
+        type: string
+        default: ""
+
+      namespace:
+        description: "Namespace/Projeto do OpenShift (obrigatório)"
+        required: true
+        type: string
+
+      create_namespace:
+        description: "Criar o namespace/projeto se não existir (requer permissão)"
+        required: false
+        type: boolean
+        default: false
+
+      chart:
+        description: "Caminho do chart Helm (local) ou nome (repo/chart)"
+        required: true
+        type: string
+
+      chart_version:
+        description: "Versão do chart Helm (para charts remotos)"
+        required: false
+        type: string
+        default: ""
+
+      repo:
+        description: "URL do repositório Helm (opcional, para charts remotos)"
+        required: false
+        type: string
+        default: ""
+
+      repo_alias:
+        description: "Alias do repositório Helm (se vazio, usa 'customrepo')"
+        required: false
+        type: string
+        default: ""
+
+      repo_username:
+        description: "Nome de usuário do repositório Helm (se usar repo com auth)"
+        required: false
+        type: string
+        default: ""
+
+      values:
+        description: "Valores adicionais do Helm (YAML). NÃO passa por envsubst."
+        required: false
+        type: string
+        default: ""
+
+      value_files:
+        description: >
+          Arquivos de values adicionais. Aceita:
+          - string única: values-dev.yaml
+          - lista JSON: ["values.yaml","values-dev.yaml"]
+          - CSV simples: values.yaml,values-dev.yaml
+        required: false
+        type: string
+        default: ""
+
+      dependency_update:
+        description: "Rodar 'helm dependency build' quando o chart for local"
+        required: false
+        type: boolean
+        default: false
+
+      task:
+        description: "Tarefa Helm (install, upgrade, uninstall/remove/delete)"
+        required: false
+        type: string
+        default: upgrade
+
+      wait:
+        description: "Se true, usa --wait (recomendado)"
+        required: false
+        type: boolean
+        default: true
+
+      atomic:
+        description: "Se true, upgrade usa --atomic (rollback em caso de falha)"
+        required: false
+        type: boolean
+        default: true
+
+      dry_run:
+        description: "Simular deploy Helm (--dry-run)"
+        required: false
+        type: boolean
+        default: false
+
+      debug:
+        description: "Habilitar debug do Helm (--debug)"
+        required: false
+        type: boolean
+        default: false
+
+      timeout:
+        description: "Tempo limite do job em minutos"
+        required: false
+        type: number
+        default: 30
+
+      timeout_helm:
+        description: "Tempo limite do deploy Helm (--timeout). Ex.: 10m, 1h"
+        required: false
+        type: string
+        default: 10m
+
+      helm_version:
+        description: "Versão do Helm a instalar (azure/setup-helm)"
+        required: false
+        type: string
+        default: v3.18.4
+
+      helm_cmd:
+        description: "Binário Helm a ser executado (helm, helm3)"
+        required: false
+        type: string
+        default: helm
+
+      extra_helm_args:
+        description: >
+          Args adicionais do Helm (opcional). Aceita:
+          - string: --set foo=bar --disable-openapi-validation
+          - lista JSON: ["--set","foo=bar","--disable-openapi-validation"]
+        required: false
+        type: string
+        default: ""
+
+      # Imagem (opcional): funciona bem para charts internos e muitos terceiros (image.repository/tag)
+      image_ref:
+        description: "Imagem completa (ex.: registry/org/app@sha256:...)"
+        required: false
+        type: string
+        default: ""
+
+      image_repository:
+        description: "Repo completo (ex.: registry/org/app) para montar com tag/digest"
+        required: false
+        type: string
+        default: ""
+
+      image_tag:
+        description: "Tag da imagem (ex.: sha7, pr-123-abc1234-rc)"
+        required: false
+        type: string
+        default: ""
+
+      image_digest:
+        description: "Digest sha256:... (imutável). Se setado com image_repository, usa @digest."
+        required: false
+        type: string
+        default: ""
+
+      validate_image:
+        description: >
+          Validar se a imagem existe antes do deploy.
+          OBS: funciona melhor com registries compatíveis com Docker Registry HTTP API (v2). Desative para Docker Hub/GAR se necessário.
+        required: false
+        type: boolean
+        default: true
+
+      skip_tls_verify:
+        description: "Skip verificação TLS para OC e validação de registry"
+        required: false
+        type: boolean
+        default: true
+
+      # Registry Secret injection (operacional; use só quando o chart suportar registrySecret.*)
+      create_registry_secret:
+        description: "Criar/injetar registrySecret.* automaticamente"
+        required: false
+        type: boolean
+        default: false
+
+      inject_image_pull_secret:
+        description: "Injetar imagePullSecrets[0].name com o secret de registry"
+        required: false
+        type: boolean
+        default: true
+
+      registry_secret_server:
+        description: "Host do registry (sem https://). Se vazio, tenta usar vars.NEXUS_HOSTED ou inferir do image_ref."
+        required: false
+        type: string
+        default: ""
+
+      enforce_registry_secret_name:
+        description: "Forçar registrySecret.name sempre não-vazio"
+        required: false
+        type: boolean
+        default: true
+
+      registry_secret_name:
+        description: "Nome do Secret de registry (se vazio e enforce=true, usa secret-<app>-registry)"
+        required: false
+        type: string
+        default: ""
+
+    outputs:
+      release_name:
+        description: "Release name final (sanitizado)"
+        value: ${{ jobs.Deploy.outputs.release_name }}
+      app_name:
+        description: "App name final (igual ao release)"
+        value: ${{ jobs.Deploy.outputs.app_name }}
+      namespace:
+        description: "Namespace usado"
+        value: ${{ jobs.Deploy.outputs.namespace }}
+      image_ref:
+        description: "Imagem final resolvida"
+        value: ${{ jobs.Deploy.outputs.image_ref }}
+      image_tag:
+        description: "Tag final resolvida (se aplicável)"
+        value: ${{ jobs.Deploy.outputs.image_tag }}
+      registry_secret_name:
+        description: "Nome do secret de pull (se enforce/create)"
+        value: ${{ jobs.Deploy.outputs.registry_secret_name }}
+      registry_server:
+        description: "Host do registry resolvido"
+        value: ${{ jobs.Deploy.outputs.registry_server }}
+
+    secrets:
+      OC_TOKEN:
+       description: "Token do OpenShift (dev|ti|trg|prd)"
+       required: true
+      OC_SERVER:
+       description: "URL do OpenShift (ex.: https://openshift.server.com)"
+       required: true
+
+      NEXUS_USER:
+        description: "Usuário do registry (opcional; necessário para validate_image/create_registry_secret em registry privado)"
+        required: false
+      NEXUS_PASS:
+        description: "Senha do registry (opcional; necessário para validate_image/create_registry_secret em registry privado)"
+        required: false
+
+      HELM_PASSWORD:
+        description: "Senha do repositório Helm (se usar repo com auth)"
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  Deploy:
+    name: Deploy Helm OpenShift ${{ inputs.environment }} 🚀
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    timeout-minutes: ${{ inputs.timeout }}
+
+    environment:
+      name: ${{ inputs.environment }}
+
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}-${{ inputs.namespace }}-${{ inputs.release || github.repository }}
+      cancel-in-progress: true
+
+    outputs:
+      release_name: ${{ steps.ctx.outputs.release_name }}
+      app_name: ${{ steps.ctx.outputs.app_name }}
+      namespace: ${{ steps.ctx.outputs.namespace }}
+      image_ref: ${{ steps.deploy.outputs.image_ref }}
+      image_tag: ${{ steps.deploy.outputs.image_tag }}
+      registry_secret_name: ${{ steps.deploy.outputs.registry_secret_name }}
+      registry_server: ${{ steps.deploy.outputs.registry_server }}
+
+    steps:
+      - name: Checkout 📥
+        if: ${{ inputs.checkout }}
+        uses: actions/checkout@v7
+
+      - name: Resolve Context 🧠
+        id: ctx
+        env:
+          RELEASE_INPUT_RAW: ${{ inputs.release }}
+          NS_INPUT: ${{ inputs.namespace }}
+        run: |
+          set -euo pipefail
+
+          sanitize_name() {
+            echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//' | cut -c1-63
+          }
+
+          NAMESPACE="${NS_INPUT:-}"
+          if [ -z "${NAMESPACE}" ]; then
+            echo "❌ namespace vazio ou não definido"
+            exit 1
+          fi
+
+          RAW="${RELEASE_INPUT_RAW:-}"
+          if [ -z "${RAW}" ]; then RAW="${GITHUB_REPOSITORY##*/}"; fi
+
+          RELEASE_NAME="$(sanitize_name "$RAW")"
+          if [ -z "${RELEASE_NAME}" ]; then
+            echo "❌ release/app ficou vazio após sanitização"
+            exit 1
+          fi
+
+          APP_NAME="${RELEASE_NAME}"
+
+          echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "app_name=${APP_NAME}" >> "$GITHUB_OUTPUT"
+          echo "namespace=${NAMESPACE}" >> "$GITHUB_OUTPUT"
+
+      - name: Guard 🛡️
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.OC_SERVER }}" ]; then
+            echo "❌ secrets.OC_SERVER vazio. Configure OC_SERVER como Environment secret (dev|ti|trg|prd)."
+            exit 1
+          fi
+
+      - name: Login no OpenShift ☁️
+        uses: redhat-actions/oc-login@v2
+        with:
+          openshift_server_url: ${{ secrets.OC_SERVER }}
+          openshift_token: ${{ secrets.OC_TOKEN }}
+          insecure_skip_tls_verify: ${{ inputs.skip_tls_verify }}
+
+      - name: Setup Namespace/Project & Secrets 📂
+        env:
+          NS: ${{ steps.ctx.outputs.namespace }}
+          CREATE_NS: ${{ inputs.create_namespace }}
+          NEXUS_HOSTED: ${{ vars.NEXUS_HOSTED }}
+          NEXUS_PROXY: ${{ vars.NEXUS_PROXY }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+        run: |
+          set -euo pipefail
+
+          oc_clean() {
+            oc "$@" 2> >(grep -v 'warnings.go:110' | grep -v 'warnings.go:70' | grep -v 'Use tokens from the TokenRequest API' >&2)
+          }
+
+          recreate_registry_secret() {
+            local secret_name="$1"
+            local registry_host="$2"
+
+            if [ -z "${registry_host}" ]; then
+              echo "❌ Registry host não informado para a secret '${secret_name}'."
+              exit 1
+            fi
+
+            if oc_clean -n "$NS" get secret "$secret_name" >/dev/null 2>&1; then
+              echo "♻️ Secret '${secret_name}' já existe. Apagando para recriar..."
+              oc_clean -n "$NS" delete secret "$secret_name"
+            else
+              echo "➕ Secret '${secret_name}' não existe. Criando..."
+            fi
+
+            oc_clean -n "$NS" create secret docker-registry "$secret_name" \
+              --docker-server="$registry_host" \
+              --docker-username="$NEXUS_USER" \
+              --docker-password="$NEXUS_PASS"
+
+            echo "✅ Secret '${secret_name}' criada/recriada com sucesso."
+          }
+
+          if oc_clean project "$NS" >/dev/null 2>&1; then
+            echo "✅ Projeto já existe: $NS"
+          else
+            if [ "${CREATE_NS}" != "true" ]; then
+              echo "❌ Namespace/Project '${NS}' não existe ou você não tem acesso."
+              echo "   Crie previamente ou rode com create_namespace=true (se tiver permissão)."
+              exit 1
+            fi
+
+            echo "➕ Criando projeto/namespace: $NS"
+            oc_clean new-project "$NS" || oc_clean create namespace "$NS"
+          fi
+
+          oc_clean project "$NS"
+
+          if [ -z "${NEXUS_USER}" ] || [ -z "${NEXUS_PASS}" ]; then
+            echo "❌ NEXUS_USER e/ou NEXUS_PASS não foram informados."
+            exit 1
+          fi
+
+          recreate_registry_secret "secret-nexus" "${NEXUS_HOSTED}"
+          recreate_registry_secret "secret-proxy" "${NEXUS_PROXY}"
+
+      - name: Setup Helm ⛵
+        uses: azure/setup-helm@v5
+        with:
+          version: ${{ inputs.helm_version }}
+
+      - name: Configurar Helm Repo 📦
+        if: ${{ inputs.repo != '' }}
+        env:
+          HELM_BIN: ${{ inputs.helm_cmd }}
+          REPO: ${{ inputs.repo }}
+          REPO_ALIAS: ${{ inputs.repo_alias }}
+          REPO_USERNAME: ${{ inputs.repo_username }}
+          REPO_PASSWORD: ${{ secrets.HELM_PASSWORD }}
+        run: |
+          set -euo pipefail
+          HELM_CMD="${HELM_BIN:-helm}"
+          REPO_ALIAS_USE="${REPO_ALIAS:-customrepo}"
+
+          if [ -n "${REPO_USERNAME:-}" ] && [ -n "${REPO_PASSWORD:-}" ]; then
+            "$HELM_CMD" repo add "$REPO_ALIAS_USE" "$REPO" --username "$REPO_USERNAME" --password "$REPO_PASSWORD"
+          else
+            "$HELM_CMD" repo add "$REPO_ALIAS_USE" "$REPO"
+          fi
+
+          "$HELM_CMD" repo update
+
+      - name: Helm Dependency Build 📦
+        if: ${{ inputs.dependency_update }}
+        env:
+          HELM_BIN: ${{ inputs.helm_cmd }}
+          CHART: ${{ inputs.chart }}
+        run: |
+          set -euo pipefail
+          HELM_CMD="${HELM_BIN:-helm}"
+
+          if [ -f "${CHART}/Chart.yaml" ]; then
+            echo "🔧 Rodando: helm dependency build ${CHART}"
+            "$HELM_CMD" dependency build "${CHART}"
+          else
+            echo "ℹ️ Chart não parece local (${CHART}); pulando dependency build."
+          fi
+
+      - name: Helm Deploy 🚀
+        id: deploy
+        env:
+          HELM_BIN: ${{ inputs.helm_cmd }}
+
+          RELEASE_NAME: ${{ steps.ctx.outputs.release_name }}
+          APP_NAME: ${{ steps.ctx.outputs.app_name }}
+          NAMESPACE: ${{ steps.ctx.outputs.namespace }}
+
+          CHART: ${{ inputs.chart }}
+          CHART_VERSION: ${{ inputs.chart_version }}
+          INLINE_VALUES: ${{ inputs.values }}
+          RAW_VALUE_FILES: ${{ inputs.value_files }}
+
+          TASK: ${{ inputs.task }}
+          WAIT: ${{ inputs.wait }}
+          ATOMIC: ${{ inputs.atomic }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          DEBUG: ${{ inputs.debug }}
+          TIMEOUT_HELM: ${{ inputs.timeout_helm }}
+
+          EXTRA_HELM_ARGS: ${{ inputs.extra_helm_args }}
+
+          IMAGE_REF_INPUT: ${{ inputs.image_ref }}
+          IMAGE_REPO_INPUT: ${{ inputs.image_repository }}
+          IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+          IMAGE_DIGEST_INPUT: ${{ inputs.image_digest }}
+
+          VALIDATE_IMAGE: ${{ inputs.validate_image }}
+          SKIP_TLS_VERIFY: ${{ inputs.skip_tls_verify }}
+
+          REG_USER: ${{ secrets.NEXUS_USER }}
+          REG_PASS: ${{ secrets.NEXUS_PASS }}
+
+          CREATE_REGISTRY_SECRET: ${{ inputs.create_registry_secret }}
+          INJECT_IMAGE_PULL_SECRET: ${{ inputs.inject_image_pull_secret }}
+          REGISTRY_SECRET_SERVER_INPUT: ${{ inputs.registry_secret_server }}
+
+          ENFORCE_REGISTRY_SECRET_NAME: ${{ inputs.enforce_registry_secret_name }}
+          REGISTRY_SECRET_NAME_INPUT: ${{ inputs.registry_secret_name }}
+
+          # org var (pode ser URL ou host/path; vamos extrair somente o host)
+          NEXUS_HOSTED: ${{ vars.NEXUS_HOSTED }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${REG_USER:-}" ]; then echo "::add-mask::${REG_USER}"; fi
+          if [ -n "${REG_PASS:-}" ]; then echo "::add-mask::${REG_PASS}"; fi
+
+          HELM_CMD="${HELM_BIN:-helm}"
+
+          helm_clean() {
+            "$HELM_CMD" "$@" 2> >(
+              grep -v 'warnings.go:110' | grep -v 'warnings.go:70' | grep -v 'Use tokens from the TokenRequest API' >&2
+            )
+          }
+
+          strip_scheme() {
+            local s="$1"
+            s="${s#http://}"; s="${s#https://}"
+            echo "$s"
+          }
+
+          host_only() {
+            local s
+            s="$(strip_scheme "$1")"
+            echo "${s%%/*}"
+          }
+
+          #########################################################
+          # 1) Resolve imagem final (prioriza image_ref)           #
+          #########################################################
+          IMAGE_REF=""
+          IMAGE_REPOSITORY=""
+          IMAGE_DIGEST=""
+          IMAGE_TAG="${IMAGE_TAG_INPUT:-}"
+
+          if [[ -n "${IMAGE_REF_INPUT:-}" ]]; then
+            IMAGE_REF="${IMAGE_REF_INPUT}"
+          elif [[ -n "${IMAGE_REPO_INPUT:-}" && -n "${IMAGE_DIGEST_INPUT:-}" ]]; then
+            IMAGE_REF="${IMAGE_REPO_INPUT}@${IMAGE_DIGEST_INPUT}"
+            IMAGE_REPOSITORY="${IMAGE_REPO_INPUT}"
+            IMAGE_DIGEST="${IMAGE_DIGEST_INPUT}"
+          elif [[ -n "${IMAGE_REPO_INPUT:-}" && -n "${IMAGE_TAG:-}" ]]; then
+            IMAGE_REF="${IMAGE_REPO_INPUT}:${IMAGE_TAG}"
+            IMAGE_REPOSITORY="${IMAGE_REPO_INPUT}"
+          fi
+
+          export IMAGE_REF IMAGE_REPOSITORY IMAGE_DIGEST IMAGE_TAG
+
+          #########################################################
+          # 2) Registry host final (input > org var > image_ref)   #
+          #########################################################
+          REGISTRY_SERVER=""
+          if [ -n "${REGISTRY_SECRET_SERVER_INPUT:-}" ]; then
+            REGISTRY_SERVER="$(host_only "${REGISTRY_SECRET_SERVER_INPUT}")"
+          elif [ -n "${NEXUS_HOSTED:-}" ]; then
+            REGISTRY_SERVER="$(host_only "${NEXUS_HOSTED}")"
+          elif [ -n "${IMAGE_REF:-}" ]; then
+            REGISTRY_SERVER="$(host_only "${IMAGE_REF}")"
+          fi
+
+          #########################################################
+          # 3) Nome do secret (nunca vazio se enforce=true)        #
+          #########################################################
+          sanitize_dns() {
+            echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//' | cut -c1-63
+          }
+
+          REGISTRY_SECRET_NAME=""
+          if [ "${ENFORCE_REGISTRY_SECRET_NAME}" = "true" ]; then
+            REGISTRY_SECRET_NAME="${REGISTRY_SECRET_NAME_INPUT:-}"
+            if [ -z "${REGISTRY_SECRET_NAME}" ]; then
+              REGISTRY_SECRET_NAME="secret-${APP_NAME}-registry"
+            fi
+            REGISTRY_SECRET_NAME="$(sanitize_dns "${REGISTRY_SECRET_NAME}")"
+          fi
+
+          #########################################################
+          # 4) Validação da imagem (opcional)                      #
+          #########################################################
+          if [[ "${VALIDATE_IMAGE}" == "true" ]]; then
+            if [[ -z "${IMAGE_REF:-}" ]]; then
+              echo "❌ validate_image=true mas IMAGE_REF não foi resolvido (passe image_ref OU image_repository+image_tag/digest)"
+              exit 1
+            fi
+
+            REF_NO_PROTO="$(strip_scheme "${IMAGE_REF}")"
+            REG_HOST="${REF_NO_PROTO%%/*}"
+            PATH_AND_REF="${REF_NO_PROTO#*/}"
+
+            if [[ "$PATH_AND_REF" == "$REG_HOST" ]]; then
+              echo "❌ IMAGE_REF inválido: ${IMAGE_REF}"
+              exit 1
+            fi
+
+            if [[ "$PATH_AND_REF" == *@* ]]; then
+              REPO_PATH="${PATH_AND_REF%@*}"
+              MANIFEST_REF="${PATH_AND_REF#*@}"
+            else
+              REPO_PATH="${PATH_AND_REF%:*}"
+              MANIFEST_REF="${PATH_AND_REF##*:}"
+            fi
+
+            CURL_TLS=()
+            if [[ "${SKIP_TLS_VERIFY}" == "true" ]]; then CURL_TLS=(-k); fi
+
+            CURL_AUTH=()
+            if [[ -n "${REG_USER:-}" && -n "${REG_PASS:-}" ]]; then
+              CURL_AUTH=(-u "${REG_USER}:${REG_PASS}")
+            fi
+
+            if ! curl -fsSL "${CURL_TLS[@]}" "${CURL_AUTH[@]}"                 -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json'                 "https://${REG_HOST}/v2/${REPO_PATH}/manifests/${MANIFEST_REF}" >/dev/null; then
+              echo "❌ Não consegui validar a imagem no registry: ${IMAGE_REF}"
+              echo "   Dica: se o registry exigir token (ex.: Docker Hub/GAR), desative validate_image."
+              exit 1
+            fi
+          fi
+
+          #########################################################
+          # 5) Helm args + values                                 #
+          #########################################################
+          TIMEOUT_ARG="${TIMEOUT_HELM:-}"
+          if [[ -n "${TIMEOUT_ARG}" && "${TIMEOUT_ARG}" =~ ^[0-9]+$ ]]; then
+            TIMEOUT_ARG="${TIMEOUT_ARG}m"
+          fi
+
+          BASE_ARGS=(--namespace "$NAMESPACE")
+          if [[ -n "${TIMEOUT_ARG:-}" ]]; then BASE_ARGS+=(--timeout "$TIMEOUT_ARG"); fi
+          if [[ "${WAIT}" == "true" ]]; then BASE_ARGS+=(--wait); fi
+          if [[ "${DRY_RUN}" == "true" ]]; then BASE_ARGS+=(--dry-run); fi
+          if [[ "${DEBUG}" == "true" ]]; then BASE_ARGS+=(--debug); fi
+
+          DEPLOY_ARGS=("${BASE_ARGS[@]}")
+          if [[ "${ATOMIC}" == "true" ]]; then DEPLOY_ARGS+=(--atomic); fi
+          if [[ -n "${CHART_VERSION:-}" ]]; then DEPLOY_ARGS+=(--version "$CHART_VERSION"); fi
+
+          UNINSTALL_ARGS=("${BASE_ARGS[@]}")
+
+          VALUE_ARGS=()
+
+          # value_files: JSON array | CSV | single
+          if [ -n "${RAW_VALUE_FILES:-}" ]; then
+            FILES_LIST=()
+
+            if echo "${RAW_VALUE_FILES}" | grep -Eq '^[[:space:]]*\['; then
+              mapfile -t FILES_LIST < <(python -c 'import json,os; raw=os.environ.get("RAW_VALUE_FILES","").strip(); arr=json.loads(raw); assert isinstance(arr,list); [print(str(x).strip()) for x in arr if str(x).strip()]') || {
+                echo "❌ value_files parece JSON mas não consegui parsear: ${RAW_VALUE_FILES}"
+                exit 1
+              }
+            elif echo "${RAW_VALUE_FILES}" | grep -q ','; then
+              IFS=',' read -r -a FILES_LIST <<< "${RAW_VALUE_FILES}"
+            else
+              FILES_LIST+=("${RAW_VALUE_FILES}")
+            fi
+
+            for f in "${FILES_LIST[@]}"; do
+              f="$(echo "$f" | tr -d '"' | xargs)"
+              [ -z "$f" ] && continue
+              VALUE_ARGS+=(--values "$f")
+            done
+          fi
+
+          # values inline (YAML)
+          if [ -n "${INLINE_VALUES:-}" ]; then
+            src="/tmp/inline-values.yaml"
+            printf '%s\n' "$INLINE_VALUES" > "$src"
+            VALUE_ARGS+=(--values "$src")
+          fi
+
+          # imagem (compatível com muitos charts)
+          if [[ -n "${IMAGE_REF:-}" ]]; then VALUE_ARGS+=(--set-string "image.ref=${IMAGE_REF}"); fi
+          if [[ -n "${IMAGE_REPOSITORY:-}" ]]; then VALUE_ARGS+=(--set-string "image.repository=${IMAGE_REPOSITORY}"); fi
+          if [[ -n "${IMAGE_TAG:-}" ]]; then VALUE_ARGS+=(--set-string "image.tag=${IMAGE_TAG}"); fi
+          if [[ -n "${IMAGE_DIGEST:-}" ]]; then VALUE_ARGS+=(--set-string "image.digest=${IMAGE_DIGEST}"); fi
+
+          # extra helm args (string ou JSON array)
+          EXTRA_ARGS=()
+          if [ -n "${EXTRA_HELM_ARGS:-}" ]; then
+            if echo "${EXTRA_HELM_ARGS}" | grep -Eq '^[[:space:]]*\['; then
+              mapfile -t EXTRA_ARGS < <(python -c 'import json,os; raw=os.environ.get("EXTRA_HELM_ARGS","").strip(); arr=json.loads(raw); assert isinstance(arr,list); [print(str(x).strip()) for x in arr if str(x).strip()]') || {
+                echo "❌ extra_helm_args parece JSON mas não consegui parsear: ${EXTRA_HELM_ARGS}"
+                exit 1
+              }
+            else
+              # split simples (não preserva quotes complexas)
+              read -r -a EXTRA_ARGS <<< "${EXTRA_HELM_ARGS}"
+            fi
+          fi
+
+          # registry secret injection (somente se o chart suportar registrySecret.*)
+          if [ "${CREATE_REGISTRY_SECRET}" = "true" ]; then
+            if [ -z "${REGISTRY_SERVER:-}" ]; then
+              echo "❌ create_registry_secret=true mas não consegui resolver o registry host."
+              echo "   Informe inputs.registry_secret_server ou configure vars.NEXUS_HOSTED, ou passe image_ref."
+              exit 1
+            fi
+
+            if [ -z "${REG_USER:-}" ] || [ -z "${REG_PASS:-}" ]; then
+              echo "❌ create_registry_secret=true exige secrets.NEXUS_USER e secrets.NEXUS_PASS"
+              exit 1
+            fi
+
+            VALUE_ARGS+=(--set "registrySecret.create=true")
+
+            if [ "${ENFORCE_REGISTRY_SECRET_NAME}" = "true" ] && [ -n "${REGISTRY_SECRET_NAME:-}" ]; then
+              VALUE_ARGS+=(--set-string "registrySecret.name=${REGISTRY_SECRET_NAME}")
+            fi
+
+            VALUE_ARGS+=(--set-string "registrySecret.server=${REGISTRY_SERVER}")
+            VALUE_ARGS+=(--set-string "registrySecret.username=${REG_USER}")
+            VALUE_ARGS+=(--set-string "registrySecret.password=${REG_PASS}")
+            VALUE_ARGS+=(--set-string "registrySecret.email=devops@vtal.intra")
+
+            if [ "${INJECT_IMAGE_PULL_SECRET}" = "true" ] && [ -n "${REGISTRY_SECRET_NAME:-}" ]; then
+              VALUE_ARGS+=(--set-string "imagePullSecrets[0].name=${REGISTRY_SECRET_NAME}")
+            fi
+          fi
+
+          echo "➡️ Helm:"
+          echo "  task=${TASK} release=${RELEASE_NAME} ns=${NAMESPACE} chart=${CHART} timeout=${TIMEOUT_ARG:-<empty>} atomic=${ATOMIC} wait=${WAIT} dry_run=${DRY_RUN}"
+          echo "  image_ref=${IMAGE_REF:-<empty>}"
+          echo "  registrySecret.create=${CREATE_REGISTRY_SECRET} name=${REGISTRY_SECRET_NAME:-<chart-default>} server=${REGISTRY_SERVER:-<empty>}"
+          if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+            echo "  extra_args=${EXTRA_ARGS[*]}"
+          fi
+
+          case "$TASK" in
+            install)
+              helm_clean install "$RELEASE_NAME" "$CHART" "${DEPLOY_ARGS[@]}" "${VALUE_ARGS[@]}" "${EXTRA_ARGS[@]}"
+              ;;
+            upgrade)
+              helm_clean upgrade "$RELEASE_NAME" "$CHART" --install "${DEPLOY_ARGS[@]}" "${VALUE_ARGS[@]}" "${EXTRA_ARGS[@]}"
+              ;;
+            uninstall|remove|delete)
+              helm_clean uninstall "$RELEASE_NAME" "${UNINSTALL_ARGS[@]}"
+              ;;
+            *)
+              echo "❌ task inválida: $TASK"
+              exit 1
+              ;;
+          esac
+
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "registry_secret_name=${REGISTRY_SECRET_NAME}" >> "$GITHUB_OUTPUT"
+          echo "registry_server=${REGISTRY_SERVER}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary 📜
+        if: ${{ success() && steps.deploy.conclusion == 'success' }}
+        env:
+          NS: ${{ steps.ctx.outputs.namespace }}
+          APP_NAME: ${{ steps.ctx.outputs.app_name }}
+        run: |
+          {
+            echo "## ✅ Deploy Helm OpenShift"
+            echo ""
+            echo "- App: \`${APP_NAME}\`"
+            echo "- Namespace: \`${NS}\`"
+            echo "- Environment: \`${{ inputs.environment }}\`"
+            echo "- Chart: \`${{ inputs.chart }}\`"
+            echo "- Task: \`${{ inputs.task }}\`"
+            echo "- Image ref: \`${{ steps.deploy.outputs.image_ref }}\`"
+            echo "- Registry server: \`${{ steps.deploy.outputs.registry_server }}\`"
+            echo "- Registry Secret: \`${{ steps.deploy.outputs.registry_secret_name }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

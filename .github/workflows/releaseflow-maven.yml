@@ -1,0 +1,1329 @@
+name: Release Flow Orchestrator Maven (GCP) ♻️
+
+on:
+  workflow_call:
+    outputs:
+      promo_ref:
+        description: "Ref (branch) promovida (ex.: release/2026-...)"
+        value: ${{ jobs.ctx.outputs.promo_ref }}
+      repository_url:
+        description: "URL do repositório Maven no GAR"
+        value: ${{ jobs.resolve_artifact.outputs.repository_url }}
+      group_id:
+        description: "groupId Maven resolvido"
+        value: ${{ jobs.resolve_artifact.outputs.group_id }}
+      artifact_id:
+        description: "artifactId Maven resolvido"
+        value: ${{ jobs.resolve_artifact.outputs.artifact_id }}
+      candidate_version:
+        description: "Versão candidata resolvida para promoção (ex.: 1.0.0-pr-52-a1b2c3d-rc)"
+        value: ${{ jobs.resolve_artifact.outputs.artifact_version }}
+      digest:
+        description: "Checksum sha256 do artefato promovido"
+        value: ${{ jobs.resolve_artifact.outputs.digest }}
+      used_tag:
+        description: "Sufixo de tag (pr-.../sha7) usado para resolver o artefato"
+        value: ${{ jobs.resolve_artifact.outputs.used_tag }}
+      pr_number:
+        description: "PR associada ao commit usada na resolução do artefato"
+        value: ${{ jobs.resolve_artifact.outputs.pr_number }}
+      release_please_pr_url:
+        description: "URL da PR criada/atualizada pelo release-please"
+        value: ${{ jobs.release_please_pr.outputs.pr_url }}
+      release_please_pr_number:
+        description: "Número da PR do release-please"
+        value: ${{ jobs.release_please_pr.outputs.pr_number }}
+      tag_name:
+        description: "Tag SemVer criada no GitHub pelo release-please publish"
+        value: ${{ jobs.release_please_publish.outputs.tag_name }}
+      release_version:
+        description: "Versão final SemVer publicada no GAR (ex.: 1.2.0)"
+        value: ${{ jobs.retag_release_artifact.outputs.release_version }}
+      sync_pr_url:
+        description: "URL da PR de sync release -> main"
+        value: ${{ jobs.sync_release_to_main.outputs.pr_url }}
+      sync_pr_number:
+        description: "Número da PR de sync release -> main"
+        value: ${{ jobs.sync_release_to_main.outputs.pr_number }}
+
+    inputs:
+      runs_on:
+        description: "Runner padrão para jobs de controle/build"
+        type: string
+        required: false
+        default: '["self-hosted","dev"]'
+
+      main_branch:
+        type: string
+        required: false
+        default: "main"
+
+      release_prefix:
+        type: string
+        required: false
+        default: "release/"
+
+      # ---- Build Maven ----
+      java_version:
+        type: string
+        required: false
+        default: "21"
+      java_distribution:
+        type: string
+        required: false
+        default: "temurin"
+      maven_version:
+        type: string
+        required: false
+        default: "3.9.9"
+      maven_args:
+        type: string
+        required: false
+        default: "-B clean package"
+      working_directory:
+        type: string
+        required: false
+        default: "."
+      push_sha_tag:
+        type: boolean
+        required: false
+        default: false
+
+      # ---- GCP GAR (Maven) ----
+      gcp_maven_repository_url:
+        description: "URL do repositório Maven no GAR. Vazio => vars.GCP_MAVEN_REPOSITORY_URL"
+        type: string
+        required: false
+        default: ""
+      gcp_workload_identity_provider:
+        description: "WIF provider. Vazio => vars.GCP_WIF_PROVIDER"
+        type: string
+        required: false
+        default: ""
+      gcp_service_account:
+        description: "Service Account para impersonar via WIF. Vazio => vars.GCP_SERVICE_ACCOUNT"
+        type: string
+        required: false
+        default: ""
+
+      # ---- Deploys VM GCP ----
+      enable_deploy_dev:
+        type: string
+        required: false
+        default: "true"
+      enable_deploy_ti:
+        type: string
+        required: false
+        default: "true"
+      enable_deploy_trg:
+        type: string
+        required: false
+        default: "true"
+      enable_deploy_prd:
+        type: string
+        required: false
+        default: "true"
+
+      environment_dev:
+        type: string
+        required: false
+        default: "dev"
+      environment_ti:
+        type: string
+        required: false
+        default: "Ti"
+      environment_trg:
+        type: string
+        required: false
+        default: "Trg"
+      environment_prd:
+        type: string
+        required: false
+        default: "Prd"
+
+      runs_on_dev:
+        description: "Runner da VM DEV (vazio => usa inputs.runs_on)"
+        type: string
+        required: false
+        default: '{"group":"devops-sre","labels":["self-hosted","devops-sre-DEV"]}'
+      runs_on_ti:
+        description: "Runner da VM TI (vazio => usa inputs.runs_on)"
+        type: string
+        required: false
+        default: ""
+      runs_on_trg:
+        description: "Runner da VM TRG (vazio => usa inputs.runs_on)"
+        type: string
+        required: false
+        default: ""
+      runs_on_prd:
+        description: "Runner da VM PRD (vazio => usa inputs.runs_on)"
+        type: string
+        required: false
+        default: ""
+
+      # ---- Multi-VM (matrix) ----
+      runner_group:
+        description: "Grupo dos runners self-hosted usados na matrix de VMs"
+        type: string
+        required: false
+        default: "devops-sre"
+
+      multi_vm_dev:
+        description: "true => deploy DEV em várias VMs (usa vms_dev). false => usa runs_on_dev"
+        type: boolean
+        required: false
+        default: false
+      vms_dev:
+        description: 'Lista JSON de labels de runners DEV. Ex.: ["vm-dev-1","vm-dev-2"]'
+        type: string
+        required: false
+        default: ""
+
+      multi_vm_ti:
+        description: "true => deploy TI em várias VMs (usa vms_ti). false => usa runs_on_ti"
+        type: boolean
+        required: false
+        default: false
+      vms_ti:
+        description: 'Lista JSON de labels de runners TI. Ex.: ["vm-ti-1","vm-ti-2"]'
+        type: string
+        required: false
+        default: ""
+
+      multi_vm_trg:
+        description: "true => deploy TRG em várias VMs (usa vms_trg). false => usa runs_on_trg"
+        type: boolean
+        required: false
+        default: false
+      vms_trg:
+        description: 'Lista JSON de labels de runners TRG. Ex.: ["vm-trg-1","vm-trg-2"]'
+        type: string
+        required: false
+        default: ""
+
+      multi_vm_prd:
+        description: "true => deploy PRD em várias VMs (usa vms_prd). false => usa runs_on_prd"
+        type: boolean
+        required: false
+        default: false
+      vms_prd:
+        description: 'Lista JSON de labels de runners PRD. Ex.: ["vm-prd-1","vm-prd-2"]'
+        type: string
+        required: false
+        default: ""
+
+      # ---- Release Please ----
+      release_please_config:
+        type: string
+        required: false
+        default: "release-please-config.json"
+      release_please_manifest:
+        type: string
+        required: false
+        default: ".release-please-manifest.json"
+
+      trigger_event_name:
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  ctx:
+    name: Context 🔎
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+
+    permissions:
+      contents: read
+      pull-requests: read
+
+    outputs:
+      event_name: ${{ steps.ctx.outputs.event_name }}
+      head_branch: ${{ steps.ctx.outputs.head_branch }}
+      base_branch: ${{ steps.ctx.outputs.base_branch }}
+      head_kind: ${{ steps.ctx.outputs.head_kind }}
+
+      is_bot_branch: ${{ steps.ctx.outputs.is_bot_branch }}
+      bot_kind: ${{ steps.ctx.outputs.bot_kind }}
+
+      is_dev_flow: ${{ steps.ctx.outputs.is_dev_flow }}
+      is_release_flow: ${{ steps.ctx.outputs.is_release_flow }}
+      release_id: ${{ steps.ctx.outputs.release_id }}
+      release_name: ${{ steps.ctx.outputs.release_name }}
+      app_name: ${{ steps.ctx.outputs.app_name }}
+
+      pr_action: ${{ steps.ctx.outputs.pr_action }}
+      pr_merged: ${{ steps.ctx.outputs.pr_merged }}
+
+      should_run_release_promotion: ${{ steps.ctx.outputs.should_run_release_promotion }}
+      promo_ref: ${{ steps.ctx.outputs.promo_ref }}
+
+      is_release_push: ${{ steps.ctx.outputs.is_release_push }}
+      is_release_please_merge_push: ${{ steps.ctx.outputs.is_release_please_merge_push }}
+      should_run_release_please_pr: ${{ steps.ctx.outputs.should_run_release_please_pr }}
+      should_run_release_please_publish: ${{ steps.ctx.outputs.should_run_release_please_publish }}
+
+      vms_dev: ${{ steps.vms.outputs.vms_dev }}
+      vms_ti: ${{ steps.vms.outputs.vms_ti }}
+      vms_trg: ${{ steps.vms.outputs.vms_trg }}
+      vms_prd: ${{ steps.vms.outputs.vms_prd }}
+
+    steps:
+      - name: Determine Context 🔎
+        id: ctx
+        run: |
+          set -euo pipefail
+
+          sanitize_name() {
+            echo "$1" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//' \
+              | cut -c1-63
+          }
+
+          EVENT_NAME="${{ inputs.trigger_event_name }}"
+          if [[ -z "${EVENT_NAME}" ]]; then EVENT_NAME="${GITHUB_EVENT_NAME}"; fi
+
+          PR_ACTION=""
+          PR_MERGED="false"
+          HEAD_BRANCH=""
+          BASE_BRANCH=""
+
+          case "${EVENT_NAME}" in
+            pull_request|pull_request_target)
+              PR_ACTION="${{ github.event.action }}"
+              PR_MERGED="${{ github.event.pull_request.merged }}"
+              [[ "${PR_MERGED}" == "true" ]] || PR_MERGED="false"
+              HEAD_BRANCH="${GITHUB_HEAD_REF:-}"
+              BASE_BRANCH="${GITHUB_BASE_REF:-}"
+              ;;
+            create)
+              HEAD_BRANCH="${GITHUB_REF_NAME:-${{ github.event.ref }}}"
+              BASE_BRANCH=""
+              ;;
+            push)
+              HEAD_BRANCH="${GITHUB_REF_NAME:-}"
+              BASE_BRANCH=""
+              ;;
+            *)
+              HEAD_BRANCH="${GITHUB_REF_NAME:-}"
+              BASE_BRANCH=""
+              ;;
+          esac
+
+          RELEASE_PREFIX="${{ inputs.release_prefix }}"
+          MAIN_BRANCH="${{ inputs.main_branch }}"
+
+          IS_BOT="false"
+          BOT_KIND=""
+          if [[ "${HEAD_BRANCH}" == release-please--* ]]; then IS_BOT="true"; BOT_KIND="release-please"; fi
+          if [[ "${HEAD_BRANCH}" == dependabot/* ]]; then IS_BOT="true"; BOT_KIND="dependabot"; fi
+
+          HEAD_KIND="other"
+          if [[ "${IS_BOT}" == "true" ]]; then
+            HEAD_KIND="bot"
+          elif [[ "${HEAD_BRANCH}" == "feature/"* ]]; then
+            HEAD_KIND="feature"
+          elif [[ "${HEAD_BRANCH}" == "bugfix/"* ]]; then
+            HEAD_KIND="bugfix"
+          elif [[ "${HEAD_BRANCH}" == "hotfix/"* ]]; then
+            HEAD_KIND="hotfix"
+          elif [[ "${HEAD_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            HEAD_KIND="release"
+          elif [[ "${HEAD_BRANCH}" == "${MAIN_BRANCH}" ]]; then
+            HEAD_KIND="main"
+          fi
+
+          IS_DEV_FLOW="false"
+          if [[ "${EVENT_NAME}" == "pull_request" && "${PR_ACTION}" != "closed" ]]; then
+            if [[ "${HEAD_KIND}" == "feature" || "${HEAD_KIND}" == "bugfix" || "${HEAD_KIND}" == "hotfix" ]]; then
+              if [[ "${BASE_BRANCH}" == "${MAIN_BRANCH}" || "${BASE_BRANCH}" == "${RELEASE_PREFIX}"* || "${BASE_BRANCH}" == "feature/"* ]]; then
+                IS_DEV_FLOW="true"
+              fi
+            fi
+          fi
+
+          IS_RELEASE_FLOW="false"
+          if [[ "${HEAD_KIND}" == "release" ]]; then IS_RELEASE_FLOW="true"; fi
+
+          RELEASE_ID=""
+          if [[ "${HEAD_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            RELEASE_ID="${HEAD_BRANCH#${RELEASE_PREFIX}}"
+          elif [[ "${BASE_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            RELEASE_ID="${BASE_BRANCH#${RELEASE_PREFIX}}"
+          fi
+
+          APP_NAME="${{ github.event.repository.name }}"
+          RELEASE_NAME="$(sanitize_name "${APP_NAME}")"
+
+          SHOULD_RUN_RELEASE_PROMOTION="false"
+          PROMO_REF=""
+
+          PUSH_CREATED="${{ github.event.created }}"
+          [[ "${PUSH_CREATED}" == "true" ]] || PUSH_CREATED="false"
+          BEFORE_SHA="${{ github.event.before }}"
+
+          if [[ "${EVENT_NAME}" == "create" && "${HEAD_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            SHOULD_RUN_RELEASE_PROMOTION="true"
+            PROMO_REF="${HEAD_BRANCH}"
+          fi
+
+          if [[ "${EVENT_NAME}" == "push" && "${HEAD_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            if [[ "${PUSH_CREATED}" == "true" || "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
+              SHOULD_RUN_RELEASE_PROMOTION="true"
+              PROMO_REF="${HEAD_BRANCH}"
+            fi
+          fi
+
+          if [[ "${EVENT_NAME}" == "pull_request" && "${PR_ACTION}" == "closed" && "${PR_MERGED}" == "true" && "${BASE_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            if [[ "${IS_BOT}" != "true" ]]; then
+              if [[ "${HEAD_KIND}" == "bugfix" || "${HEAD_KIND}" == "hotfix" ]]; then
+                SHOULD_RUN_RELEASE_PROMOTION="true"
+                PROMO_REF="${BASE_BRANCH}"
+              fi
+            fi
+          fi
+
+          IS_RELEASE_PUSH="false"
+          if [[ "${EVENT_NAME}" == "push" && "${HEAD_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            IS_RELEASE_PUSH="true"
+          fi
+
+          IS_RELEASE_PLEASE_MERGE_PUSH="false"
+          if [[ "${EVENT_NAME}" == "push" && "${IS_RELEASE_PUSH}" == "true" ]]; then
+            GH_TOKEN="${{ github.token }}"
+            PULLS_JSON="$(curl -sS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${{ github.api_url }}/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls?per_page=10" || true)"
+
+            IS_RP="$(python3 -c "import json,sys; s=sys.stdin.read().strip(); d=json.loads(s) if s else []; print(\"true\" if any(((pr.get(\"head\") or {}).get(\"ref\",\"\")).startswith(\"release-please--\") for pr in d) else \"false\")" <<<"${PULLS_JSON}")"
+            [[ "${IS_RP}" == "true" ]] && IS_RELEASE_PLEASE_MERGE_PUSH="true"
+          fi
+
+          SHOULD_RUN_RELEASE_PLEASE_PR="false"
+          SHOULD_RUN_RELEASE_PLEASE_PUBLISH="false"
+          [[ "${SHOULD_RUN_RELEASE_PROMOTION}" == "true" ]] && SHOULD_RUN_RELEASE_PLEASE_PR="true"
+          [[ "${IS_RELEASE_PLEASE_MERGE_PUSH}" == "true" ]] && SHOULD_RUN_RELEASE_PLEASE_PUBLISH="true"
+
+          {
+            echo "event_name=${EVENT_NAME}"
+            echo "head_branch=${HEAD_BRANCH}"
+            echo "base_branch=${BASE_BRANCH}"
+            echo "head_kind=${HEAD_KIND}"
+            echo "is_bot_branch=${IS_BOT}"
+            echo "bot_kind=${BOT_KIND}"
+            echo "is_dev_flow=${IS_DEV_FLOW}"
+            echo "is_release_flow=${IS_RELEASE_FLOW}"
+            echo "pr_action=${PR_ACTION}"
+            echo "pr_merged=${PR_MERGED}"
+            echo "should_run_release_promotion=${SHOULD_RUN_RELEASE_PROMOTION}"
+            echo "promo_ref=${PROMO_REF}"
+            echo "is_release_push=${IS_RELEASE_PUSH}"
+            echo "is_release_please_merge_push=${IS_RELEASE_PLEASE_MERGE_PUSH}"
+            echo "should_run_release_please_pr=${SHOULD_RUN_RELEASE_PLEASE_PR}"
+            echo "should_run_release_please_publish=${SHOULD_RUN_RELEASE_PLEASE_PUBLISH}"
+            echo "release_id=${RELEASE_ID}"
+            echo "release_name=${RELEASE_NAME}"
+            echo "app_name=${APP_NAME}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve VM Matrix 🖥️
+        id: vms
+        env:
+          MULTI_DEV: ${{ inputs.multi_vm_dev }}
+          LIST_DEV: ${{ inputs.vms_dev }}
+          MULTI_TI: ${{ inputs.multi_vm_ti }}
+          LIST_TI: ${{ inputs.vms_ti }}
+          MULTI_TRG: ${{ inputs.multi_vm_trg }}
+          LIST_TRG: ${{ inputs.vms_trg }}
+          MULTI_PRD: ${{ inputs.multi_vm_prd }}
+          LIST_PRD: ${{ inputs.vms_prd }}
+        run: |
+          set -euo pipefail
+
+          # multi_vm_<env>=false => matriz de 1 item ("__default__"), que usa o runs_on_<env>
+          # multi_vm_<env>=true  => valida a lista JSON (vms_<env>) e gera uma instância por VM
+          resolve_vms() {
+            local label="$1" enabled="${2,,}" list="$3"
+
+            if [[ "${enabled}" != "true" ]]; then
+              echo '["__default__"]'
+              return 0
+            fi
+
+            if [[ -z "${list// /}" ]]; then
+              echo "::error::multi_vm_${label}=true, mas vms_${label} (vars.VMS_${label^^}) está vazia." >&2
+              return 1
+            fi
+
+            LIST="${list}" LABEL="${label}" python3 - <<'PY'
+          import json, os, sys
+          label = os.environ["LABEL"]
+          try:
+              d = json.loads(os.environ["LIST"])
+          except Exception as e:
+              print(f"::error::vms_{label}: JSON inválido ({e}). Use aspas duplas.", file=sys.stderr)
+              sys.exit(1)
+          if not isinstance(d, list) or not d or not all(isinstance(x, str) and x.strip() for x in d):
+              print(f"::error::vms_{label}: esperado array JSON não vazio de strings.", file=sys.stderr)
+              sys.exit(1)
+          d = [x.strip() for x in d]
+          if len(set(d)) != len(d):
+              print(f"::error::vms_{label}: há VMs duplicadas na lista.", file=sys.stderr)
+              sys.exit(1)
+          print(json.dumps(d, separators=(",", ":")))
+          PY
+          }
+
+          VMS_DEV="$(resolve_vms dev "${MULTI_DEV}" "${LIST_DEV}")"
+          VMS_TI="$(resolve_vms ti "${MULTI_TI}" "${LIST_TI}")"
+          VMS_TRG="$(resolve_vms trg "${MULTI_TRG}" "${LIST_TRG}")"
+          VMS_PRD="$(resolve_vms prd "${MULTI_PRD}" "${LIST_PRD}")"
+
+          {
+            echo "vms_dev=${VMS_DEV}"
+            echo "vms_ti=${VMS_TI}"
+            echo "vms_trg=${VMS_TRG}"
+            echo "vms_prd=${VMS_PRD}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Maven & Push GCP ♻️
+    needs: [ctx]
+    if: >-
+      ${{
+        needs.ctx.outputs.event_name == 'pull_request' &&
+        needs.ctx.outputs.pr_action != 'closed' &&
+        needs.ctx.outputs.is_dev_flow == 'true' &&
+        needs.ctx.result == 'success'
+      }}
+    uses: mrrdev4/shared-workflows/.github/workflows/build-maven.yml@feature/add-deploy-vm-gcp
+    with:
+      runs_on: ${{ inputs.runs_on }}
+      environment: ${{ inputs.environment_dev }}
+      java_version: ${{ inputs.java_version }}
+      java_distribution: ${{ inputs.java_distribution }}
+      maven_version: ${{ inputs.maven_version }}
+      maven_args: ${{ inputs.maven_args }}
+      working_directory: ${{ inputs.working_directory }}
+      push_sha_tag: ${{ inputs.push_sha_tag }}
+      gcp_maven_repository_url: ${{ inputs.gcp_maven_repository_url }}
+      gcp_workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
+      gcp_service_account: ${{ inputs.gcp_service_account }}
+
+  deploy_dev:
+    name: Deploy DEV ⛵
+    needs: [ctx, build]
+    if: >-
+      ${{
+        inputs.enable_deploy_dev == 'true' &&
+        needs.ctx.outputs.is_dev_flow == 'true' &&
+        needs.build.result == 'success' &&
+        needs.build.outputs.artifact_version != ''
+      }}
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        vm: ${{ fromJson(needs.ctx.outputs.vms_dev) }}
+    uses: mrrdev4/shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    with:
+      runs_on: >-
+        ${{ matrix.vm == '__default__'
+            && (inputs.runs_on_dev != '' && inputs.runs_on_dev || inputs.runs_on)
+            || format('{{"group":"{0}","labels":["self-hosted","{1}"]}}', inputs.runner_group, matrix.vm) }}
+      environment: ${{ inputs.environment_dev }}
+      repository_url: ${{ needs.build.outputs.repository_url }}
+      group_id: ${{ needs.build.outputs.group_id }}
+      artifact_id: ${{ needs.build.outputs.artifact_id }}
+      artifact_version: ${{ needs.build.outputs.artifact_version }}
+      gcp_workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
+      gcp_service_account: ${{ inputs.gcp_service_account }}
+
+  resolve_artifact:
+    name: Resolve Maven Artifact 🧾
+    needs: [ctx]
+    if: ${{ needs.ctx.outputs.should_run_release_promotion == 'true' || needs.ctx.outputs.should_run_release_please_publish == 'true' }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write
+    outputs:
+      repository_url: ${{ steps.refs.outputs.repository_url }}
+      group_id: ${{ steps.coords.outputs.group_id }}
+      artifact_id: ${{ steps.coords.outputs.artifact_id }}
+      base_version: ${{ steps.coords.outputs.base_version }}
+      artifact_version: ${{ steps.out.outputs.artifact_version }}
+      artifact_uri: ${{ steps.out.outputs.artifact_uri }}
+      digest: ${{ steps.out.outputs.digest }}
+      used_tag: ${{ steps.out.outputs.used_tag }}
+      pr_number: ${{ steps.out.outputs.pr_number }}
+      pr_head_sha: ${{ steps.out.outputs.pr_head_sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout 📥
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.ctx.outputs.promo_ref != '' && needs.ctx.outputs.promo_ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Resolve GCP Registry 📌
+        id: refs
+        env:
+          INPUT_URL: ${{ inputs.gcp_maven_repository_url }}
+          V_GCP_MAVEN_REPOSITORY_URL: ${{ vars.GCP_MAVEN_REPOSITORY_URL }}
+          INPUT_WIF_PROVIDER: ${{ inputs.gcp_workload_identity_provider }}
+          V_GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          INPUT_GCP_SA: ${{ inputs.gcp_service_account }}
+          V_GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+
+          REPO_URL="${INPUT_URL:-${V_GCP_MAVEN_REPOSITORY_URL}}"
+          WIF_PROVIDER="${INPUT_WIF_PROVIDER:-${V_GCP_WIF_PROVIDER}}"
+          GCP_SA="${INPUT_GCP_SA:-${V_GCP_SERVICE_ACCOUNT}}"
+
+          : "${REPO_URL:?Defina inputs.gcp_maven_repository_url ou vars.GCP_MAVEN_REPOSITORY_URL}"
+          : "${WIF_PROVIDER:?Defina inputs.gcp_workload_identity_provider ou vars.GCP_WIF_PROVIDER}"
+          : "${GCP_SA:?Defina inputs.gcp_service_account ou vars.GCP_SERVICE_ACCOUNT}"
+
+          REPO_URL="${REPO_URL#artifactregistry://}"
+          REPO_URL="${REPO_URL#https://}"
+          REPO_URL="https://${REPO_URL%/}"
+
+          echo "repository_url=${REPO_URL}" >> "$GITHUB_OUTPUT"
+          echo "gcp_wif_provider=${WIF_PROVIDER}" >> "$GITHUB_OUTPUT"
+          echo "gcp_service_account=${GCP_SA}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract Base Coordinates 🧭
+        id: coords
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          SHOULD_PUBLISH: ${{ needs.ctx.outputs.should_run_release_please_publish }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # Se for execução de publish do release-please, lê o pom.xml do commit anterior ao merge
+          # (para obter a versão base exata com que o artefato candidato foi construído)
+          WORK_POM="pom.xml"
+          if [[ "${SHOULD_PUBLISH}" == "true" && -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            REL_DIR="${{ inputs.working_directory }}"
+            REL_DIR="${REL_DIR#./}"
+            [[ "${REL_DIR}" == "." ]] && POM_GIT_PATH="pom.xml" || POM_GIT_PATH="${REL_DIR}/pom.xml"
+            git show "${BEFORE_SHA}:${POM_GIT_PATH}" > "${RUNNER_TEMP}/before-pom.xml"
+            WORK_POM="${RUNNER_TEMP}/before-pom.xml"
+          fi
+
+          read -r GROUP_ID ARTIFACT_ID CURRENT_VERSION < <(python3 - "${WORK_POM}" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          tree = ET.parse(sys.argv[1])
+          root = tree.getroot()
+          ns = {'m': root.tag.split('}')[0].strip('{')} if '}' in root.tag else {}
+          def find_val(tag):
+              el = root.find(f"m:{tag}", ns) if ns else root.find(tag)
+              if el is None:
+                  parent = root.find("m:parent", ns) if ns else root.find("parent")
+                  if parent is not None:
+                      el = parent.find(f"m:{tag}", ns) if ns else parent.find(tag)
+              return el.text.strip() if el is not None and el.text else ""
+          print(f"{find_val('groupId')} {find_val('artifactId')} {find_val('version')}")
+          PY
+          )
+
+          BASE_VERSION="${CURRENT_VERSION%-SNAPSHOT}"
+
+          echo "group_id=${GROUP_ID}" >> "$GITHUB_OUTPUT"
+          echo "artifact_id=${ARTIFACT_ID}" >> "$GITHUB_OUTPUT"
+          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Auth to Google Cloud
+        id: gcp_auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ steps.refs.outputs.gcp_wif_provider }}
+          service_account: ${{ steps.refs.outputs.gcp_service_account }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+
+      - name: Resolve Candidate Version & Digest in GAR 🔎
+        id: out
+        env:
+          GCP_TOKEN: ${{ steps.gcp_auth.outputs.access_token }}
+          REPO_URL: ${{ steps.refs.outputs.repository_url }}
+          GROUP_ID: ${{ steps.coords.outputs.group_id }}
+          ARTIFACT_ID: ${{ steps.coords.outputs.artifact_id }}
+          BASE_VERSION: ${{ steps.coords.outputs.base_version }}
+          IS_PUBLISH: ${{ needs.ctx.outputs.should_run_release_please_publish }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          GROUP_PATH="${GROUP_ID//./\/}"
+
+          check_version_exists() {
+            local ver="$1"
+            local url="${REPO_URL}/${GROUP_PATH}/${ARTIFACT_ID}/${ver}/${ARTIFACT_ID}-${ver}.jar"
+            local code
+            code="$(curl -s -o /dev/null -w '%{http_code}' -r 0-0 \
+              -H "Authorization: Bearer ${GCP_TOKEN}" "${url}" || true)"
+            echo "  tentativa: ${ver} -> HTTP ${code}" >&2
+            case "${code}" in
+              200|206) return 0 ;;
+              404)     return 1 ;;
+              *)
+                echo "::warning::HTTP inesperado (${code}) ao checar ${url} (401/403 = auth/permissão do GAR)" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          fetch_sha256() {
+            local ver="$1"
+            local sha_url="${REPO_URL}/${GROUP_PATH}/${ARTIFACT_ID}/${ver}/${ARTIFACT_ID}-${ver}.jar.sha256"
+            local jar_url="${REPO_URL}/${GROUP_PATH}/${ARTIFACT_ID}/${ver}/${ARTIFACT_ID}-${ver}.jar"
+            local digest=""
+
+            digest="$(curl -fsSL -H "Authorization: Bearer ${GCP_TOKEN}" "${sha_url}" 2>/dev/null | awk '{print $1}' | tr -d '\r\n' || true)"
+            if [[ -z "${digest}" ]]; then
+              digest="$(curl -fsSL -H "Authorization: Bearer ${GCP_TOKEN}" "${jar_url}" | sha256sum | awk '{print $1}')"
+            fi
+            echo "${digest}"
+          }
+
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          if [[ "${IS_PUBLISH}" == "true" ]]; then
+            COMMIT_SHA="${BEFORE_SHA}"
+          fi
+
+          # --- PR associada ao commit (best-effort; nunca quebra o step) ---
+          PULLS_FILE="$(mktemp)"
+          trap 'rm -f "${PULLS_FILE}"' EXIT
+
+          HTTP_PULLS="$(curl -sS -o "${PULLS_FILE}" -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}/pulls?per_page=1" || echo "000")"
+
+          PR_NUMBER=""
+          HEAD_SHA=""
+          read -r PR_NUMBER HEAD_SHA < <(python3 - "${PULLS_FILE}" <<'PY'
+          import json, sys
+          try:
+              with open(sys.argv[1]) as f:
+                  d = json.load(f)
+          except Exception:
+              d = []
+          if isinstance(d, list) and d:
+              print(d[0].get("number", ""), (d[0].get("head") or {}).get("sha", ""))
+          else:
+              if isinstance(d, dict):
+                  print("::warning::GitHub API: " + str(d.get("message")), file=sys.stderr)
+              print("", "")
+          PY
+          ) || true
+
+          if [[ -z "${HEAD_SHA}" ]]; then
+            HEAD_SHA="${COMMIT_SHA}"
+          fi
+          SHA7="${HEAD_SHA:0:7}"
+
+          CANDIDATE_TAGS=()
+          if [[ -n "${PR_NUMBER}" ]]; then
+            CANDIDATE_TAGS+=( "pr-${PR_NUMBER}-${SHA7}-rc" )
+          fi
+          CANDIDATE_TAGS+=(
+            "${SHA7}"
+            "sha-${HEAD_SHA}"
+            "sha-${SHA7}"
+          )
+
+          # --- diagnóstico ---
+          echo "COMMIT_SHA=${COMMIT_SHA} PR_NUMBER=${PR_NUMBER:-<vazio>} HEAD_SHA=${HEAD_SHA} BASE_VERSION=${BASE_VERSION} (pulls API HTTP ${HTTP_PULLS})"
+          echo "Candidatas: ${CANDIDATE_TAGS[*]}"
+
+          RESOLVED_VERSION=""
+          USED_TAG=""
+          DIGEST=""
+
+          for t in "${CANDIDATE_TAGS[@]}"; do
+            [[ -z "${t}" || "${t}" == "pr--"* ]] && continue
+            SAFE_TAG="$(printf '%s' "${t}" | tr -c 'A-Za-z0-9._-' '-')"
+            CAND_VER="${BASE_VERSION}-${SAFE_TAG}"
+
+            if check_version_exists "${CAND_VER}"; then
+              USED_TAG="${t}"
+              RESOLVED_VERSION="${CAND_VER}"
+              DIGEST="$(fetch_sha256 "${CAND_VER}")"
+              break
+            fi
+          done
+
+          if [[ -z "${RESOLVED_VERSION}" ]]; then
+            echo "::error::❌ Não encontrei artefato no GAR para nenhuma versão candidata."
+            echo "Base version: ${BASE_VERSION}"
+            echo "Sufixos testados: ${CANDIDATE_TAGS[*]}"
+            echo "Repositório: ${REPO_URL}/${GROUP_PATH}/${ARTIFACT_ID}/"
+            exit 1
+          fi
+
+          ARTIFACT_URI="${REPO_URL}/${GROUP_PATH}/${ARTIFACT_ID}/${RESOLVED_VERSION}/${ARTIFACT_ID}-${RESOLVED_VERSION}.jar"
+
+          {
+            echo "pr_number=${PR_NUMBER}"
+            echo "pr_head_sha=${HEAD_SHA}"
+            echo "used_tag=${USED_TAG}"
+            echo "artifact_version=${RESOLVED_VERSION}"
+            echo "artifact_uri=${ARTIFACT_URI}"
+            echo "digest=${DIGEST}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Resolve Maven Artifact"
+            echo "- coordinates: \`${GROUP_ID}:${ARTIFACT_ID}:${RESOLVED_VERSION}\`"
+            echo "- used_tag: \`${USED_TAG}\`"
+            echo "- pr: \`${PR_NUMBER}\`"
+            echo "- head_sha: \`${HEAD_SHA}\`"
+            echo "- sha256: \`${DIGEST}\`"
+            echo "- uri: \`${ARTIFACT_URI}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy_ti:
+    name: Deploy TI 🧪
+    needs: [ctx, resolve_artifact]
+    if: >-
+      ${{
+        inputs.enable_deploy_ti == 'true' &&
+        needs.ctx.outputs.should_run_release_promotion == 'true' &&
+        needs.resolve_artifact.result == 'success' &&
+        needs.resolve_artifact.outputs.artifact_version != ''
+      }}
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        vm: ${{ fromJson(needs.ctx.outputs.vms_ti) }}
+    uses: mrrdev4/shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    with:
+      runs_on: >-
+        ${{ matrix.vm == '__default__'
+            && (inputs.runs_on_ti != '' && inputs.runs_on_ti || inputs.runs_on)
+            || format('{{"group":"{0}","labels":["self-hosted","{1}"]}}', inputs.runner_group, matrix.vm) }}
+      environment: ${{ inputs.environment_ti }}
+      repository_url: ${{ needs.resolve_artifact.outputs.repository_url }}
+      group_id: ${{ needs.resolve_artifact.outputs.group_id }}
+      artifact_id: ${{ needs.resolve_artifact.outputs.artifact_id }}
+      artifact_version: ${{ needs.resolve_artifact.outputs.artifact_version }}
+      gcp_workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
+      gcp_service_account: ${{ inputs.gcp_service_account }}
+
+  deploy_trg:
+    name: Deploy TRG 🧫
+    needs: [ctx, resolve_artifact, deploy_ti]
+    if: >-
+      ${{
+        always() &&
+        inputs.enable_deploy_trg == 'true' &&
+        needs.ctx.outputs.should_run_release_promotion == 'true' &&
+        needs.resolve_artifact.result == 'success' &&
+        needs.resolve_artifact.outputs.artifact_version != '' &&
+        (
+          inputs.enable_deploy_ti != 'true' ||
+          needs.deploy_ti.result == 'success'
+        )
+      }}
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        vm: ${{ fromJson(needs.ctx.outputs.vms_trg) }}
+    uses: mrrdev4/shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    with:
+      runs_on: >-
+        ${{ matrix.vm == '__default__'
+            && (inputs.runs_on_trg != '' && inputs.runs_on_trg || inputs.runs_on)
+            || format('{{"group":"{0}","labels":["self-hosted","{1}"]}}', inputs.runner_group, matrix.vm) }}
+      environment: ${{ inputs.environment_trg }}
+      repository_url: ${{ needs.resolve_artifact.outputs.repository_url }}
+      group_id: ${{ needs.resolve_artifact.outputs.group_id }}
+      artifact_id: ${{ needs.resolve_artifact.outputs.artifact_id }}
+      artifact_version: ${{ needs.resolve_artifact.outputs.artifact_version }}
+      gcp_workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
+      gcp_service_account: ${{ inputs.gcp_service_account }}
+
+  release_please_pr:
+    name: Release Pull Request 🔗
+    environment: Release
+    needs: [ctx, resolve_artifact, deploy_ti, deploy_trg]
+    if: >-
+      ${{
+        always() &&
+        needs.ctx.outputs.should_run_release_please_pr == 'true' &&
+        needs.resolve_artifact.result == 'success' &&
+        (
+          inputs.enable_deploy_ti != 'true' ||
+          needs.deploy_ti.result == 'success'
+        ) &&
+        (
+          inputs.enable_deploy_trg != 'true' ||
+          needs.deploy_trg.result == 'success'
+        )
+      }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    permissions:
+      contents: write
+      pull-requests: write
+
+    outputs:
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+
+    steps:
+      - name: Pick Token
+        id: tok
+        run: |
+          set -euo pipefail
+          T="${{ secrets.RELEASE_PLEASE_TOKEN }}"
+          if [[ -z "${T:-}" ]]; then T="${{ github.token }}"; fi
+          echo "token=${T}" >> "$GITHUB_OUTPUT"
+
+      - id: rp
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ steps.tok.outputs.token }}
+          config-file: ${{ inputs.release_please_config }}
+          manifest-file: ${{ inputs.release_please_manifest }}
+          target-branch: ${{ needs.ctx.outputs.promo_ref }}
+          skip-github-release: true
+
+      - name: Capture Release-Please PR 🔗
+        id: pr
+        shell: bash
+        env:
+          PRS: ${{ steps.rp.outputs.prs }}
+        run: |
+          set -euo pipefail
+
+          PR_NUMBERS="$(python3 - <<'PY'
+          import os, json
+          s = os.environ.get("PRS","") or ""
+          nums=[]
+          try:
+            prs=json.loads(s)
+            if isinstance(prs,list):
+              for pr in prs:
+                n = pr.get("number")
+                if n is not None:
+                  nums.append(str(n))
+          except Exception:
+            pass
+          print(",".join(nums))
+          PY
+          )"
+
+          FIRST_PR_NUMBER="${PR_NUMBERS%%,*}"
+          PR_URL=""
+          if [[ -n "${FIRST_PR_NUMBER}" ]]; then
+            PR_URL="https://github.com/${GITHUB_REPOSITORY}/pull/${FIRST_PR_NUMBER}"
+          fi
+
+          echo "pr_number=${FIRST_PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Release Please 🧾"
+            if [[ -n "${PR_NUMBERS}" ]]; then
+              echo "- PR(s):"
+              IFS=',' read -ra ARR <<< "${PR_NUMBERS}"
+              for n in "${ARR[@]}"; do
+                echo "  - [#${n}](https://github.com/${GITHUB_REPOSITORY}/pull/${n})"
+              done
+            else
+              echo "- PR: (nenhuma PR criada/atualizada nesta execução)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release_please_publish:
+    name: Create Tag On GitHub 🏷️
+    needs: [ctx, resolve_artifact]
+    if: >-
+      ${{
+        needs.ctx.outputs.should_run_release_please_publish == 'true'
+      }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      releases_created: ${{ steps.rp.outputs.releases_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - name: Pick Token
+        id: tok
+        run: |
+          set -euo pipefail
+          T="${{ secrets.RELEASE_PLEASE_TOKEN }}"
+          if [[ -z "${T:-}" ]]; then T="${{ github.token }}"; fi
+          echo "token=${T}" >> "$GITHUB_OUTPUT"
+
+      - id: rp
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ steps.tok.outputs.token }}
+          config-file: ${{ inputs.release_please_config }}
+          manifest-file: ${{ inputs.release_please_manifest }}
+          target-branch: ${{ needs.ctx.outputs.head_branch }}
+          skip-github-pull-request: true
+
+  retag_release_artifact:
+    name: Promote Maven Artifact to SemVer 🏷️
+    needs: [ctx, resolve_artifact, release_please_publish]
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    permissions:
+      contents: read
+      id-token: write
+    if: >-
+      ${{
+        needs.ctx.outputs.should_run_release_please_publish == 'true' &&
+        needs.release_please_publish.outputs.releases_created == 'true' &&
+        needs.release_please_publish.outputs.tag_name != '' &&
+        needs.resolve_artifact.outputs.artifact_version != ''
+      }}
+    outputs:
+      release_version: ${{ steps.promote.outputs.release_version }}
+      artifact_uri: ${{ steps.promote.outputs.artifact_uri }}
+    steps:
+      - name: Checkout 📥
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Resolve GCP Registry 📌
+        id: refs
+        env:
+          INPUT_URL: ${{ inputs.gcp_maven_repository_url }}
+          V_GCP_MAVEN_REPOSITORY_URL: ${{ vars.GCP_MAVEN_REPOSITORY_URL }}
+          INPUT_WIF_PROVIDER: ${{ inputs.gcp_workload_identity_provider }}
+          V_GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          INPUT_GCP_SA: ${{ inputs.gcp_service_account }}
+          V_GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          REPO_URL="${INPUT_URL:-${V_GCP_MAVEN_REPOSITORY_URL}}"
+          WIF_PROVIDER="${INPUT_WIF_PROVIDER:-${V_GCP_WIF_PROVIDER}}"
+          GCP_SA="${INPUT_GCP_SA:-${V_GCP_SERVICE_ACCOUNT}}"
+
+          REPO_URL="${REPO_URL#artifactregistry://}"
+          REPO_URL="${REPO_URL#https://}"
+          REPO_URL="https://${REPO_URL%/}"
+
+          echo "repository_url=${REPO_URL}" >> "$GITHUB_OUTPUT"
+          echo "gcp_wif_provider=${WIF_PROVIDER}" >> "$GITHUB_OUTPUT"
+          echo "gcp_service_account=${GCP_SA}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup JDK ☕
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ inputs.java_distribution }}
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+
+      - name: Setup Maven
+        env:
+          MAVEN_VERSION: ${{ inputs.maven_version }}
+        run: |
+          set -euo pipefail
+          MVN_DIR="${RUNNER_TEMP}/apache-maven-${MAVEN_VERSION}"
+          curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" \
+            | tar -xz -C "${RUNNER_TEMP}"
+          echo "${MVN_DIR}/bin" >> "$GITHUB_PATH"
+          echo "MAVEN_HOME=${MVN_DIR}" >> "$GITHUB_ENV"
+
+      - name: Auth to Google Cloud
+        id: gcp_auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ steps.refs.outputs.gcp_wif_provider }}
+          service_account: ${{ steps.refs.outputs.gcp_service_account }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+
+      - name: Download Candidate JAR & Republish as SemVer Release 📦
+        id: promote
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          GCP_TOKEN: ${{ steps.gcp_auth.outputs.access_token }}
+          REPO_URL: ${{ steps.refs.outputs.repository_url }}
+          GROUP_ID: ${{ needs.resolve_artifact.outputs.group_id }}
+          ARTIFACT_ID: ${{ needs.resolve_artifact.outputs.artifact_id }}
+          CANDIDATE_VERSION: ${{ needs.resolve_artifact.outputs.artifact_version }}
+          EXPECTED_DIGEST: ${{ needs.resolve_artifact.outputs.digest }}
+          TAG_NAME: ${{ needs.release_please_publish.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          # Remove prefixo 'v' da tag SemVer (ex.: v1.2.0 -> 1.2.0)
+          RELEASE_VERSION="${TAG_NAME#v}"
+          GROUP_PATH="${GROUP_ID//./\/}"
+
+          SRC_URL="${REPO_URL}/${GROUP_PATH}/${ARTIFACT_ID}/${CANDIDATE_VERSION}/${ARTIFACT_ID}-${CANDIDATE_VERSION}.jar"
+          DST_URL="${REPO_URL}/${GROUP_PATH}/${ARTIFACT_ID}/${RELEASE_VERSION}/${ARTIFACT_ID}-${RELEASE_VERSION}.jar"
+
+          # Verifica se a versão SemVer já existe no GAR
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' -r 0-0 \
+            -H "Authorization: Bearer ${GCP_TOKEN}" "${DST_URL}")"
+
+          if [[ "${CODE}" == "200" || "${CODE}" == "206" ]]; then
+            echo "::notice::Versão ${RELEASE_VERSION} já existe no GAR."
+          else
+            TMP_JAR="${RUNNER_TEMP}/${ARTIFACT_ID}-${RELEASE_VERSION}.jar"
+            SETTINGS="${RUNNER_TEMP}/settings.xml"
+            trap 'rm -f "${TMP_JAR}" "${SETTINGS}"' EXIT
+
+            echo "Downloading candidate ${SRC_URL} ..."
+            curl -fsSL --retry 3 \
+              -H "Authorization: Bearer ${GCP_TOKEN}" \
+              -o "${TMP_JAR}" "${SRC_URL}"
+
+            ACTUAL_DIGEST="$(sha256sum "${TMP_JAR}" | awk '{print $1}')"
+            if [[ -n "${EXPECTED_DIGEST}" && "${ACTUAL_DIGEST}" != "${EXPECTED_DIGEST}" ]]; then
+              echo "::error::Checksum mismatch! Esperado: ${EXPECTED_DIGEST}, Obtido: ${ACTUAL_DIGEST}"
+              exit 1
+            fi
+
+            # Ajusta o pom.xml local para a versão SemVer final
+            mvn -B -q versions:set -DnewVersion="${RELEASE_VERSION}" -DgenerateBackupPoms=false
+
+            umask 077
+            cat > "${SETTINGS}" <<EOF
+          <settings>
+            <servers>
+              <server>
+                <id>gar</id>
+                <username>oauth2accesstoken</username>
+                <password>${GCP_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+            mvn -B -e -s "${SETTINGS}" deploy:deploy-file \
+              -Dfile="${TMP_JAR}" \
+              -DpomFile=pom.xml \
+              -DrepositoryId=gar \
+              -Durl="${REPO_URL}"
+          fi
+
+          echo "release_version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "artifact_uri=${DST_URL}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Promote Maven Artifact"
+            echo "- src: \`${GROUP_ID}:${ARTIFACT_ID}:${CANDIDATE_VERSION}\`"
+            echo "- dst: \`${GROUP_ID}:${ARTIFACT_ID}:${RELEASE_VERSION}\`"
+            echo "- sha256: \`${EXPECTED_DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy_prd:
+    name: Deploy PRD 🚀
+    needs: [ctx, resolve_artifact, retag_release_artifact]
+    if: >-
+      ${{
+        inputs.enable_deploy_prd == 'true' &&
+        needs.ctx.outputs.should_run_release_please_publish == 'true' &&
+        needs.retag_release_artifact.result == 'success' &&
+        needs.retag_release_artifact.outputs.release_version != ''
+      }}
+    strategy:
+      fail-fast: true
+      # PRD: os runners compartilham o mesmo label (devops-sre-PRD).
+      # Rodar os jobs da matrix em paralelo faz cada runner pegar um job,
+      # evitando que o 2º job caia no mesmo runner do 1º.
+      max-parallel: 2
+      matrix:
+        # Serve apenas para criar 1 job por VM (a lista vem de vars.VMS_PRD).
+        # Os valores NÃO são usados como label de runner.
+        vm: ${{ fromJson(needs.ctx.outputs.vms_prd) }}
+    uses: mrrdev4/shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    with:
+      # Sempre usa o label de PRD vindo do caller (runs_on_prd), independente de matrix.vm.
+      runs_on: ${{ inputs.runs_on_prd != '' && inputs.runs_on_prd || inputs.runs_on }}
+      environment: ${{ inputs.environment_prd }}
+      repository_url: ${{ needs.resolve_artifact.outputs.repository_url }}
+      group_id: ${{ needs.resolve_artifact.outputs.group_id }}
+      artifact_id: ${{ needs.resolve_artifact.outputs.artifact_id }}
+      artifact_version: ${{ needs.retag_release_artifact.outputs.release_version }}
+      gcp_workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
+      gcp_service_account: ${{ inputs.gcp_service_account }}
+
+  sync_release_to_main:
+    name: Sync Release To Main 🔁
+    needs: [ctx, release_please_publish, retag_release_artifact, deploy_prd]
+    if: >-
+      ${{
+        always() &&
+        needs.release_please_publish.result == 'success' &&
+        needs.retag_release_artifact.result == 'success' &&
+        (
+          inputs.enable_deploy_prd != 'true' ||
+          needs.deploy_prd.result == 'success'
+        ) &&
+        needs.release_please_publish.outputs.releases_created == 'true' &&
+        needs.release_please_publish.outputs.tag_name != ''
+      }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+
+    permissions:
+      pull-requests: write
+      contents: write
+
+    outputs:
+      pr_url: ${{ steps.sync_pr.outputs.pr_url }}
+      pr_number: ${{ steps.sync_pr.outputs.pr_number }}
+
+    steps:
+      - name: Open PR Release To Main
+        id: sync_pr
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const head  = process.env.HEAD_BRANCH;
+            const base  = process.env.BASE_BRANCH;
+            const tag   = process.env.TAG_NAME;
+
+            const existing = await github.rest.pulls.list({
+              owner, repo,
+              state: 'open',
+              head: `${owner}:${head}`,
+              base
+            });
+
+            if (existing.data.length > 0) {
+              const pr = existing.data[0];
+              core.setOutput('pr_url', pr.html_url);
+              core.setOutput('pr_number', String(pr.number));
+              core.info(`Já existe PR aberta: ${pr.html_url}`);
+              return;
+            }
+
+            try {
+              const title = `chore(sync): ${head} To ${base} (${tag})`;
+              const body  = `Sync automático após release publish.\n\nTag: \`${tag}\``;
+
+              const pr = await github.rest.pulls.create({
+                owner, repo, head, base, title, body
+              });
+
+              core.setOutput('pr_url', pr.data.html_url);
+              core.setOutput('pr_number', String(pr.data.number));
+              core.notice(`PR criada: ${pr.data.html_url}`);
+            } catch (e) {
+              core.warning(e.message);
+              core.setOutput('pr_url', '');
+              core.setOutput('pr_number', '');
+            }
+        env:
+          HEAD_BRANCH: ${{ needs.ctx.outputs.head_branch }}
+          BASE_BRANCH: ${{ inputs.main_branch }}
+          TAG_NAME: ${{ needs.release_please_publish.outputs.tag_name }}
+
+  summary:
+    name: Summary 📜
+    needs:
+      [
+        ctx,
+        build,
+        deploy_dev,
+        resolve_artifact,
+        deploy_ti,
+        deploy_trg,
+        deploy_prd,
+        release_please_pr,
+        release_please_publish,
+        retag_release_artifact,
+        sync_release_to_main
+      ]
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    if: ${{ always() }}
+    steps:
+      - name: Final summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RP_PR_URL="${{ needs.release_please_pr.outputs.pr_url }}"
+          RP_PR_NUM="${{ needs.release_please_pr.outputs.pr_number }}"
+
+          SYNC_PR_URL="${{ needs.sync_release_to_main.outputs.pr_url }}"
+          SYNC_PR_NUM="${{ needs.sync_release_to_main.outputs.pr_number }}"
+
+          {
+            echo "## Release Flow Maven — Resumo"
+            echo
+            echo "- event: \`${{ needs.ctx.outputs.event_name }}\`"
+            echo "- head_branch: \`${{ needs.ctx.outputs.head_branch }}\`"
+            echo "- promo_ref: \`${{ needs.ctx.outputs.promo_ref || 'Not Promo' }}\`"
+            echo "- should_run_release_promotion: \`${{ needs.ctx.outputs.should_run_release_promotion }}\`"
+            echo "- should_run_release_please_pr: \`${{ needs.ctx.outputs.should_run_release_please_pr }}\`"
+            echo "- should_run_release_please_publish: \`${{ needs.ctx.outputs.should_run_release_please_publish }}\`"
+            echo
+            echo "### Jobs"
+            echo "- release_please_pr: \`${{ needs.release_please_pr.result || 'skipped' }}\`"
+            echo "- release_please_publish: \`${{ needs.release_please_publish.result || 'skipped' }}\`"
+            echo "- retag_release_artifact: \`${{ needs.retag_release_artifact.result || 'skipped' }}\`"
+            echo "- sync_release_to_main: \`${{ needs.sync_release_to_main.result || 'skipped' }}\`"
+            echo
+            echo "### Pull Requests"
+
+            if [[ -n "${RP_PR_URL}" && "${RP_PR_URL}" == http* ]]; then
+              if [[ -n "${RP_PR_NUM}" ]]; then
+                echo "- Release Please PR: [#${RP_PR_NUM}](${RP_PR_URL})"
+              else
+                echo "- Release Please PR: ${RP_PR_URL}"
+              fi
+            else
+              echo "- Release Please PR: <none>"
+            fi
+
+            if [[ -n "${SYNC_PR_URL}" && "${SYNC_PR_URL}" == http* ]]; then
+              if [[ -n "${SYNC_PR_NUM}" ]]; then
+                echo "- Sync PR (release → main): [#${SYNC_PR_NUM}](${SYNC_PR_URL})"
+              else
+                echo "- Sync PR (release → main): ${SYNC_PR_URL}"
+              fi
+            else
+              echo "- Sync PR (release → main): <none>"
+            fi
+
+            echo
+            echo "### Environments"
+            echo "- deploy_dev: \`${{ needs.deploy_dev.result || 'skipped' }}\`"
+            echo "- deploy_ti: \`${{ needs.deploy_ti.result || 'skipped' }}\`"
+            echo "- deploy_trg: \`${{ needs.deploy_trg.result || 'skipped' }}\`"
+            echo "- deploy_prd: \`${{ needs.deploy_prd.result || 'skipped' }}\`"
+            echo
+            echo "### Results"
+            echo "- build: \`${{ needs.build.result || 'skipped' }}\`"
+            echo "- resolve_artifact: \`${{ needs.resolve_artifact.result || 'skipped' }}\`"
+            echo "- coordinates: \`${{ needs.resolve_artifact.outputs.group_id || 'n/a' }}:${{ needs.resolve_artifact.outputs.artifact_id || 'n/a' }}\`"
+            echo "- candidate_version: \`${{ needs.resolve_artifact.outputs.artifact_version || 'n/a' }}\`"
+            echo "- digest (sha256): \`${{ needs.resolve_artifact.outputs.digest || 'n/a' }}\`"
+            echo "- used_tag: \`${{ needs.resolve_artifact.outputs.used_tag || 'n/a' }}\`"
+            echo "- pr_number: \`${{ needs.resolve_artifact.outputs.pr_number || 'n/a' }}\`"
+            echo "- release_version_prd: \`${{ needs.retag_release_artifact.outputs.release_version || 'n/a' }}\`"
+            echo "- tag_name: \`${{ needs.release_please_publish.outputs.tag_name || 'n/a' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

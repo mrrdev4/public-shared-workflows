@@ -1,0 +1,331 @@
+name: Build Maven & Push GCP ♻️
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        type: string
+        required: false
+        default: '["self-hosted","dev"]'
+
+      environment:
+        description: "GitHub Environment de onde ler vars/secrets (ex: dev)"
+        type: string
+        required: false
+        default: "dev"
+
+      java_version:
+        description: "Versão do JDK usada no build"
+        type: string
+        required: false
+        default: "21"
+
+      java_distribution:
+        type: string
+        required: false
+        default: "temurin"
+
+      maven_version:
+        description: "Versão do Maven usada no build"
+        type: string
+        required: false
+        default: "3.9.9"
+
+      maven_args:
+        description: "Argumentos do Maven"
+        type: string
+        required: false
+        default: "-B clean package"
+
+      working_directory:
+        description: "Diretório do projeto Maven (onde está o pom.xml)"
+        type: string
+        required: false
+        default: "."
+
+      push_sha_tag:
+        description: "Se true, também publica a tag sha-<fullsha> (além da tag principal)"
+        type: boolean
+        required: false
+        default: false
+
+      # ---- GCP GAR (Maven) ----
+      gcp_maven_repository_url:
+        description: "URL do repositório Maven no GAR. Vazio => vars.GCP_MAVEN_REPOSITORY_URL"
+        type: string
+        required: false
+        default: ""
+
+      gcp_workload_identity_provider:
+        description: "WIF provider (projects/.../providers/...). Vazio => vars.GCP_WIF_PROVIDER"
+        type: string
+        required: false
+        default: ""
+
+      gcp_service_account:
+        description: "Service Account para impersonar via WIF. Vazio => vars.GCP_SERVICE_ACCOUNT"
+        type: string
+        required: false
+        default: ""
+
+    outputs:
+      tag:
+        value: ${{ jobs.build.outputs.tag }}
+      tag_sha:
+        value: ${{ jobs.build.outputs.tag_sha }}
+      repository_url:
+        value: ${{ jobs.build.outputs.repository_url }}
+      group_id:
+        value: ${{ jobs.build.outputs.group_id }}
+      artifact_id:
+        value: ${{ jobs.build.outputs.artifact_id }}
+      artifact_version:
+        value: ${{ jobs.build.outputs.artifact_version }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build Maven & Push GCP ♻️
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+
+    outputs:
+      tag: ${{ steps.tags.outputs.tag }}
+      tag_sha: ${{ steps.tags.outputs.tag_sha }}
+      repository_url: ${{ steps.refs.outputs.repository_url }}
+      group_id: ${{ steps.coords.outputs.group_id }}
+      artifact_id: ${{ steps.coords.outputs.artifact_id }}
+      artifact_version: ${{ steps.coords.outputs.artifact_version }}
+
+    steps:
+      - name: Checkout 📥
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # em PR, garante build do commit do HEAD (e não do merge commit)
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Resolve GCP Registry 📌
+        id: refs
+        env:
+          INPUT_URL: ${{ inputs.gcp_maven_repository_url }}
+          V_GCP_MAVEN_REPOSITORY_URL: ${{ vars.GCP_MAVEN_REPOSITORY_URL }}
+          INPUT_WIF_PROVIDER: ${{ inputs.gcp_workload_identity_provider }}
+          V_GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          INPUT_GCP_SA: ${{ inputs.gcp_service_account }}
+          V_GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+
+          REPO_URL="${INPUT_URL:-${V_GCP_MAVEN_REPOSITORY_URL}}"
+          WIF_PROVIDER="${INPUT_WIF_PROVIDER:-${V_GCP_WIF_PROVIDER}}"
+          GCP_SA="${INPUT_GCP_SA:-${V_GCP_SERVICE_ACCOUNT}}"
+
+          : "${REPO_URL:?Defina inputs.gcp_maven_repository_url ou vars.GCP_MAVEN_REPOSITORY_URL}"
+          : "${WIF_PROVIDER:?Defina inputs.gcp_workload_identity_provider ou vars.GCP_WIF_PROVIDER}"
+          : "${GCP_SA:?Defina inputs.gcp_service_account ou vars.GCP_SERVICE_ACCOUNT}"
+
+          # normaliza: aceita artifactregistry:// ou https://, sem barra final
+          REPO_URL="${REPO_URL#artifactregistry://}"
+          REPO_URL="${REPO_URL#https://}"
+          REPO_URL="https://${REPO_URL%/}"
+
+          echo "repository_url=${REPO_URL}" >> "$GITHUB_OUTPUT"
+          echo "gcp_wif_provider=${WIF_PROVIDER}" >> "$GITHUB_OUTPUT"
+          echo "gcp_service_account=${GCP_SA}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute Tags 🏷️
+        id: tags
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${EVENT}" == "pull_request" ]]; then
+            BR="${HEAD_REF}"
+            SHA="${PR_HEAD_SHA}"
+            SHA7="${SHA:0:7}"
+
+            if [[ "${BR}" =~ ^(feature|bugfix|hotfix)/ ]]; then
+              TAG="pr-${PR_NUM}-${SHA7}-rc"
+            else
+              DATE="$(date -u +%d-%m-%Y)"
+              TAG="pr-${PR_NUM}-${DATE}-${SHA7}"
+            fi
+          else
+            BR="${REF_NAME}"
+            SHA="${GITHUB_SHA}"
+            SHA7="${SHA:0:7}"
+
+            if [[ "${BR}" =~ ^(feature|bugfix|hotfix)/ ]]; then
+              TAG="${SHA7}"
+            else
+              DATE="$(date -u +%d-%m-%Y)"
+              BR_SAFE="${BR//\//-}"
+              BR_SAFE="${BR_SAFE,,}"
+              TAG="${DATE}-${SHA7}-${BR_SAFE}"
+            fi
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag_sha=sha-${SHA}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup JDK ☕
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ inputs.java_distribution }}
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+
+      - name: Setup Maven
+        env:
+          MAVEN_VERSION: ${{ inputs.maven_version }}
+        run: |
+          set -euo pipefail
+          MVN_DIR="${RUNNER_TEMP}/apache-maven-${MAVEN_VERSION}"
+          curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" \
+            | tar -xz -C "${RUNNER_TEMP}"
+          echo "${MVN_DIR}/bin" >> "$GITHUB_PATH"
+          echo "MAVEN_HOME=${MVN_DIR}" >> "$GITHUB_ENV"
+          "${MVN_DIR}/bin/mvn" -version
+
+      - name: Set Unique Maven Version 🔢
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          TAG: ${{ steps.tags.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          CURRENT="$(mvn -q -B -DforceStdout help:evaluate -Dexpression=project.version)"
+          BASE="${CURRENT%-SNAPSHOT}"
+          SAFE_TAG="$(printf '%s' "${TAG}" | tr -c 'A-Za-z0-9._-' '-')"
+          NEW_VERSION="${BASE}-${SAFE_TAG}"
+
+          echo "Versão: ${CURRENT} -> ${NEW_VERSION}"
+          mvn -B -q versions:set -DnewVersion="${NEW_VERSION}" -DgenerateBackupPoms=false
+
+      - name: Project Coordinates 🧭
+        id: coords
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          eval_expr() { mvn -q -B -DforceStdout help:evaluate -Dexpression="$1"; }
+          echo "group_id=$(eval_expr project.groupId)" >> "$GITHUB_OUTPUT"
+          echo "artifact_id=$(eval_expr project.artifactId)" >> "$GITHUB_OUTPUT"
+          echo "artifact_version=$(eval_expr project.version)" >> "$GITHUB_OUTPUT"
+
+      - name: Auth to Google Cloud
+        id: gcp_auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ steps.refs.outputs.gcp_wif_provider }}
+          service_account: ${{ steps.refs.outputs.gcp_service_account }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+
+      - name: Check if version already exists 🔎
+        id: check_version
+        env:
+          GCP_TOKEN: ${{ steps.gcp_auth.outputs.access_token }}
+          REPO_URL: ${{ steps.refs.outputs.repository_url }}
+          GROUP_ID: ${{ steps.coords.outputs.group_id }}
+          ARTIFACT_ID: ${{ steps.coords.outputs.artifact_id }}
+          VERSION: ${{ steps.coords.outputs.artifact_version }}
+        run: |
+          set -euo pipefail
+
+          GROUP_PATH="${GROUP_ID//./\/}"
+          URL="${REPO_URL}/${GROUP_PATH}/${ARTIFACT_ID}/${VERSION}/${ARTIFACT_ID}-${VERSION}.jar"
+
+          # GET de 1 byte (evita baixar o jar inteiro)
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' -r 0-0 \
+            -H "Authorization: Bearer ${GCP_TOKEN}" "${URL}")"
+
+          case "${CODE}" in
+            200|206)
+              echo "::notice::Versão ${VERSION} já existe no GAR, pulando publish."
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Resposta inesperada (HTTP ${CODE}) ao checar ${URL}"
+              exit 1
+              ;;
+          esac
+
+      - name: Build Maven 🛠️
+        if: ${{ steps.check_version.outputs.exists != 'true' }}
+        working-directory: ${{ inputs.working_directory }}
+        run: mvn ${{ inputs.maven_args }}
+
+      - name: Push to GCP Artifact Registry ♻️
+        id: push_gcp
+        if: ${{ steps.check_version.outputs.exists != 'true' }}
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          GCP_TOKEN: ${{ steps.gcp_auth.outputs.access_token }}
+          REPO_URL: ${{ steps.refs.outputs.repository_url }}
+        run: |
+          set -euo pipefail
+
+          SETTINGS="${RUNNER_TEMP}/settings.xml"
+          trap 'rm -f "${SETTINGS}"' EXIT
+
+          # jar principal gerado no build (ignora sources, javadoc, tests e original-*)
+          mapfile -t JARS < <(find target -maxdepth 1 -name '*.jar' \
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar' \
+            ! -name '*-tests.jar' ! -name 'original-*.jar')
+
+          if [[ "${#JARS[@]}" -ne 1 ]]; then
+            echo "::error::JAR NOT FOUND! ${#JARS[@]}: ${JARS[*]:-nenhum}"
+            exit 1
+          fi
+          JAR="${JARS[0]}"
+          echo "Publishing ${JAR}"
+
+          umask 077
+          cat > "${SETTINGS}" <<EOF
+          <settings>
+            <servers>
+              <server>
+                <id>gar</id>
+                <username>oauth2accesstoken</username>
+                <password>${GCP_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+          mvn -B  -e -X -s "${SETTINGS}" deploy:deploy-file \
+            -Dfile="${JAR}" \
+            -DpomFile=pom.xml \
+            -DrepositoryId=gar \
+            -Durl="${REPO_URL}"
+
+      - name: Summary 📜
+        if: ${{ always() }}
+        env:
+          TAG: ${{ steps.tags.outputs.tag }}
+          TAG_SHA: ${{ steps.tags.outputs.tag_sha }}
+          REPO_URL: ${{ steps.refs.outputs.repository_url }}
+          EXISTS: ${{ steps.check_version.outputs.exists }}
+        run: |
+          {
+            echo "## Build Maven & Push GCP ♻️ - Summary"
+            echo ""
+            echo "- tag principal: \`${TAG}\`"
+            echo "- tag sha: \`${TAG_SHA}\`"
+            echo "- repositório: \`${REPO_URL}\`"
+            if [[ "${EXISTS:-}" == "true" ]]; then
+              echo "- publish: SKIPPED!! (This version already exists in GAR.)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

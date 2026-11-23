@@ -1,0 +1,14 @@
+name: Pre Commit Hooks 🧰
+
+on:
+  [pull_request]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  PreCommmit:
+    name: Pre Commit Hooks 🧰
+    uses: ./.github/workflows/pre-commit.yml
+    secrets: inherit # pragma: allowlist secrets

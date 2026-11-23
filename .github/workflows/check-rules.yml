@@ -1,0 +1,800 @@
+name: Validate ReleaseFlow 🛡️
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: Runner labels (JSON array). Ex ["self-hosted","dev"]
+        type: string
+        required: false
+        default: '["self-hosted","dev"]'
+
+      main_branch:
+        description: Nome da branch principal
+        type: string
+        required: false
+        default: "main"
+
+      release_prefix:
+        description: Prefixo das branches de release (ex release/)
+        type: string
+        required: false
+        default: "release/"
+
+      feature_prefix:
+        description: Prefixo das branches feature (ex feature/)
+        type: string
+        required: false
+        default: "feature/"
+
+      bugfix_prefix:
+        description: Prefixo das branches bugfix (ex bugfix/)
+        type: string
+        required: false
+        default: "bugfix/"
+
+      hotfix_prefix:
+        description: Prefixo das branches hotfix (ex hotfix/)
+        type: string
+        required: false
+        default: "hotfix/"
+
+      trigger_event_name:
+        description: "Evento original do caller (ex: push, pull_request, create, workflow_dispatch)."
+        type: string
+        required: false
+        default: ""
+
+      push_created:
+        description: "Para eventos push, indica se o push criou a branch (github.event.created)."
+        type: boolean
+        required: false
+        default: false
+
+      ignore_bot_prs:
+        description: "Ignora PRs criadas por bots (ex release-please[bot])."
+        type: boolean
+        required: false
+        default: true
+
+      allow_workflow_dispatch:
+        description: "Permite rodar ReleaseFlow em workflow_dispatch."
+        type: boolean
+        required: false
+        default: true
+
+      hotfix_tag_regex:
+        description: 'Regex do formato de tag de release (base de hotfix). Ex: ^v?\d+\.\d+\.\d+.*$'
+        type: string
+        required: false
+        default: '^v?[0-9]+\.[0-9]+\.[0-9]+.*$'
+
+    outputs:
+      ok:
+        value: ${{ jobs.validate.outputs.ok }}
+      branch_type:
+        value: ${{ jobs.validate.outputs.branch_type }}
+      head_branch:
+        value: ${{ jobs.validate.outputs.head_branch }}
+      base_branch:
+        value: ${{ jobs.validate.outputs.base_branch }}
+      event_name:
+        value: ${{ jobs.validate.outputs.event_name }}
+
+      should_run:
+        value: ${{ jobs.validate.outputs.should_run }}
+      reason:
+        value: ${{ jobs.validate.outputs.reason }}
+      is_release_create:
+        value: ${{ jobs.validate.outputs.is_release_create }}
+      is_release_push:
+        value: ${{ jobs.validate.outputs.is_release_push }}
+      is_pr:
+        value: ${{ jobs.validate.outputs.is_pr }}
+      is_release_pr_merged:
+        value: ${{ jobs.validate.outputs.is_release_pr_merged }}
+      should_run_sonar:
+        value: ${{ jobs.validate.outputs.should_run_sonar }}
+      reason_sonar:
+        value: ${{ jobs.validate.outputs.reason_sonar }}
+      should_run_dev:
+        description: "Indica se o fluxo Dev deve executar build/deploy para feature, bugfix ou hotfix."
+        value: ${{ jobs.validate.outputs.should_run_dev }}
+      reason_dev:
+        description: "Motivo da decisão do fluxo Dev."
+        value: ${{ jobs.validate.outputs.reason_dev }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: Guard 🛡️
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+
+    permissions:
+      contents: read
+      pull-requests: read
+
+    outputs:
+      ok: ${{ steps.validate.outputs.ok }}
+      report: ${{ steps.validate.outputs.report }}
+      branch_type: ${{ steps.ctx.outputs.branch_type }}
+      head_branch: ${{ steps.ctx.outputs.head_branch }}
+      base_branch: ${{ steps.ctx.outputs.base_branch }}
+      event_name: ${{ steps.ctx.outputs.event_name }}
+
+      should_run: ${{ steps.guard.outputs.should_run }}
+      reason: ${{ steps.guard.outputs.reason }}
+      is_release_create: ${{ steps.guard.outputs.is_release_create }}
+      is_release_push: ${{ steps.guard.outputs.is_release_push }}
+      is_pr: ${{ steps.guard.outputs.is_pr }}
+      is_release_pr_merged: ${{ steps.guard.outputs.is_release_pr_merged }}
+      should_run_sonar: ${{ steps.guard.outputs.should_run_sonar }}
+      reason_sonar: ${{ steps.guard.outputs.reason_sonar }}
+      should_run_dev: ${{ steps.guard.outputs.should_run_dev }}
+      reason_dev: ${{ steps.guard.outputs.reason_dev }}
+
+    steps:
+      - name: Checkout Full 📥
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          ref: >-
+            ${{
+              (
+                (inputs.trigger_event_name == 'pull_request' || inputs.trigger_event_name == 'pull_request_target')
+                && github.event.pull_request.head.sha
+              )
+              || (
+                (inputs.trigger_event_name == 'create' && github.event.ref_type == 'branch')
+                && format('refs/heads/{0}', github.event.ref)
+              )
+              || github.sha
+            }}
+
+      - name: Fetch All Branches & Tags 📥
+        run: |
+          set -euo pipefail
+          git fetch --prune origin \
+            "+refs/heads/*:refs/remotes/origin/*" \
+            "+refs/tags/*:refs/tags/*"
+
+      - name: Detect Context 📝
+        shell: bash
+        id: ctx
+        run: |
+          set -euo pipefail
+          EVENT="${{ inputs.trigger_event_name }}"
+          if [[ -z "${EVENT}" ]]; then EVENT="${GITHUB_EVENT_NAME}"; fi
+
+          # Em reusable workflow (workflow_call), github.ref_name/head_ref/base_ref podem vir vazios.
+          # Por isso, usamos o payload do evento ($GITHUB_EVENT_PATH) como fonte principal.
+          if [[ "$EVENT" == "pull_request" || "$EVENT" == "pull_request_target" ]]; then
+            HEAD_BRANCH="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e.get("pull_request",{}).get("head",{}).get("ref",""))' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+            BASE_BRANCH="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e.get("pull_request",{}).get("base",{}).get("ref",""))' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+          elif [[ "$EVENT" == "create" ]]; then
+            # create event: branch ou tag. Queremos o nome em e.ref
+            HEAD_BRANCH="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e.get("ref",""))' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+            BASE_BRANCH=""
+          else
+            # push / workflow_dispatch / etc
+            REF="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e.get("ref",""))' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+            if [[ -n "${REF}" ]]; then
+              HEAD_BRANCH="${REF#refs/heads/}"
+            else
+              # fallback: github.ref_name (melhor que GITHUB_REF_NAME em workflow_call)
+              HEAD_BRANCH="${{ github.ref_name }}"
+            fi
+            BASE_BRANCH=""
+          fi
+
+          TYPE="other"
+          if [[ -n "${HEAD_BRANCH}" ]]; then
+            if [[ "$HEAD_BRANCH" == release-please--* || "$HEAD_BRANCH" == release-please-* || "$HEAD_BRANCH" == dependabot/* ]]; then
+              TYPE="automation"
+            elif [[ "$HEAD_BRANCH" == "${{ inputs.feature_prefix }}"* ]]; then
+              TYPE="feature"
+            elif [[ "$HEAD_BRANCH" == "${{ inputs.bugfix_prefix }}"* ]]; then
+              TYPE="bugfix"
+            elif [[ "$HEAD_BRANCH" == "${{ inputs.hotfix_prefix }}"* ]]; then
+              TYPE="hotfix"
+            elif [[ "$HEAD_BRANCH" == "${{ inputs.release_prefix }}"* ]]; then
+              TYPE="release"
+            fi
+          fi
+
+          echo "event_name=$EVENT" >> "$GITHUB_OUTPUT"
+          echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "base_branch=$BASE_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "branch_type=$TYPE" >> "$GITHUB_OUTPUT"
+
+      - name: Guard Decision 🛡️
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ steps.ctx.outputs.event_name }}
+          HEAD_BRANCH: ${{ steps.ctx.outputs.head_branch }}
+          BRANCH_TYPE: ${{ steps.ctx.outputs.branch_type }}
+          HOTFIX_TAG_REGEX: ${{ inputs.hotfix_tag_regex }}
+          BASE_BRANCH: ${{ steps.ctx.outputs.base_branch }}
+          PUSH_CREATED: ${{ inputs.push_created }}
+          MAIN_BRANCH: ${{ inputs.main_branch }}
+          RELEASE_PREFIX: ${{ inputs.release_prefix }}
+          FEATURE_PREFIX: ${{ inputs.feature_prefix }}
+          BUGFIX_PREFIX: ${{ inputs.bugfix_prefix }}
+          HOTFIX_PREFIX: ${{ inputs.hotfix_prefix }}
+          IGNORE_BOT_PRS: ${{ inputs.ignore_bot_prs }}
+          ALLOW_WORKFLOW_DISPATCH: ${{ inputs.allow_workflow_dispatch }}
+        run: |
+          set -euo pipefail
+
+          SHOULD_RUN_SONAR="false"
+          REASON_SONAR="not-applicable"
+
+          SHOULD_RUN_DEV="false"
+          REASON_DEV="not-applicable"
+
+          SHOULD_RUN="false"
+          REASON="not-applicable"
+          IS_PR="false"
+          IS_RELEASE_CREATE="false"
+          IS_RELEASE_PUSH="false"
+          IS_RELEASE_PR_MERGED="false"
+
+          # Automations nunca disparam o releaseflow
+          if [[ "${BRANCH_TYPE}" == "automation" ]]; then
+            SHOULD_RUN="false"
+            REASON="automation"
+            SHOULD_RUN_DEV="false"
+            REASON_DEV="automation"
+          else
+            # workflow_dispatch (manual)
+            if [[ "${EVENT}" == "workflow_dispatch" ]]; then
+              if [[ "${ALLOW_WORKFLOW_DISPATCH}" == "true" ]]; then
+                SHOULD_RUN="true"
+                REASON="manual-dispatch"
+
+                if [[ "${BRANCH_TYPE}" == "feature" || "${BRANCH_TYPE}" == "bugfix" || "${BRANCH_TYPE}" == "hotfix" ]]; then
+                  SHOULD_RUN_DEV="true"
+                  REASON_DEV="manual-dispatch-dev-branch"
+                else
+                  SHOULD_RUN_DEV="false"
+                  REASON_DEV="manual-dispatch-not-dev-branch"
+                fi
+              else
+                SHOULD_RUN="false"
+                REASON="manual-dispatch-disabled"
+                SHOULD_RUN_DEV="false"
+                REASON_DEV="manual-dispatch-disabled"
+              fi
+            fi
+
+            # create release/**
+            if [[ "${EVENT}" == "create" && "${REASON}" == "not-applicable" ]]; then
+              REF_TYPE="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e.get("ref_type",""))' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+              REF="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e.get("ref",""))' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+
+              if [[ "${REF_TYPE}" == "branch" && "${REF}" == ${RELEASE_PREFIX}* ]]; then
+                IS_RELEASE_CREATE="true"
+
+                # Se a release/** foi criada a partir de TAG (caso hotfix),
+                # não deve iniciar o fluxo.
+                TAGS="$(git tag --points-at HEAD 2>/dev/null || true)"
+                MATCHED="$(echo "${TAGS}" | grep -E "${HOTFIX_TAG_REGEX}" || true)"
+
+                if [[ -n "${MATCHED}" ]]; then
+                  TAGS_ONE_LINE="$(echo "${MATCHED}" | tr '\n' ',' | sed 's/,$//')"
+                  SHOULD_RUN="false"
+                  REASON="release-branch-created-from-tag:${TAGS_ONE_LINE} (skip)"
+                  SHOULD_RUN_SONAR="true"
+                  REASON_SONAR="release-baseline-created-from-tag:${TAGS_ONE_LINE}"
+                elif [[ -n "${TAGS}" ]]; then
+                  TAGS_ONE_LINE="$(echo "${TAGS}" | tr '\n' ',' | sed 's/,$//')"
+                  SHOULD_RUN="false"
+                  REASON="release-branch-created-from-nonrelease-tag:${TAGS_ONE_LINE} (skip)"
+                  SHOULD_RUN_SONAR="false"
+                  REASON_SONAR="release-created-from-nonrelease-tag (no baseline)"
+                else
+                  SHOULD_RUN="true"
+                  REASON="release-branch-created-from-branch"
+                  SHOULD_RUN_SONAR="true"
+                  REASON_SONAR="release-baseline-on-create"
+                fi
+              else
+                SHOULD_RUN="false"
+                REASON="create-not-release-branch"
+              fi
+            fi
+
+          # push release/**:
+          # - se for push de criação (github.event.created), trata como "create" (fallback)
+          # - se for merge push do release-please, permite (para publish/tag)
+          # - caso contrário, bloqueia push direto/duplicidade
+          if [[ "${EVENT}" == "push" && "${REASON}" == "not-applicable" ]]; then
+            if [[ "${HEAD_BRANCH}" == ${RELEASE_PREFIX}* ]]; then
+              IS_RELEASE_PUSH="true"
+              SHOULD_RUN_SONAR="false"
+              REASON_SONAR="push-release"
+
+              if [[ "${PUSH_CREATED}" == "true" ]]; then
+                # Fallback para repos que não escutam "create": primeira atualização da branch
+                TAGS="$(git tag --points-at HEAD 2>/dev/null || true)"
+                MATCHED="$(echo "${TAGS}" | grep -E "${HOTFIX_TAG_REGEX}" || true)"
+
+                if [[ -n "${MATCHED}" ]]; then
+                  TAGS_ONE_LINE="$(echo "${MATCHED}" | tr '\n' ',' | sed 's/,$//')"
+                  SHOULD_RUN="false"
+                  REASON="release-branch-created-from-tag:${TAGS_ONE_LINE} (skip)"
+                elif [[ -n "${TAGS}" ]]; then
+                  TAGS_ONE_LINE="$(echo "${TAGS}" | tr '\n' ',' | sed 's/,$//')"
+                  SHOULD_RUN="false"
+                  REASON="release-branch-created-from-nonrelease-tag:${TAGS_ONE_LINE} (skip)"
+                else
+                  SHOULD_RUN="true"
+                  REASON="release-branch-created-from-branch (push-created-fallback)"
+                  SHOULD_RUN_SONAR="true"
+                  REASON_SONAR="release-baseline-on-push-created-fallback"
+                fi
+              else
+                # Para push "normal" em release/**, só permitimos quando vier de merge do release-please
+                PULLS_JSON="$(curl -sS \
+                  -H "Authorization: Bearer ${GH_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls?per_page=10" || true)"
+
+                RP_HEAD="$(python3 -c 'import json,sys; d=json.loads(sys.stdin.read() or "[]"); ok=lambda r: r.startswith("release-please--") or r.startswith("release-please-"); print(next(((pr.get("head",{}) or {}).get("ref","") for pr in d if ok((pr.get("head",{}) or {}).get("ref",""))), ""))' <<< "${PULLS_JSON}" 2>/dev/null || true)"
+
+                if [[ -n "${RP_HEAD}" ]]; then
+                  SHOULD_RUN="true"
+                  REASON="release-please-merge-push:${RP_HEAD}"
+                else
+                  SHOULD_RUN="false"
+                  REASON="push-release-disabled"
+                fi
+              fi
+            else
+              SHOULD_RUN="false"
+              REASON="push-not-release-branch"
+
+              # DevFlow: push em feature/bugfix/hotfix executa somente quando há alteração efetiva.
+              if [[ "${HEAD_BRANCH}" == ${FEATURE_PREFIX}* || "${HEAD_BRANCH}" == ${BUGFIX_PREFIX}* || "${HEAD_BRANCH}" == ${HOTFIX_PREFIX}* ]]; then
+                COMMITS_LEN="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(len(e.get("commits") or []))' "$GITHUB_EVENT_PATH" 2>/dev/null || echo 0)"
+
+                # Branch criada via UI normalmente vem como created=true e commits=[].
+                # Nesse caso não há código novo para analisar, construir ou implantar.
+                if [[ "${PUSH_CREATED}" == "true" && "${COMMITS_LEN}" == "0" ]]; then
+                  SHOULD_RUN_DEV="false"
+                  REASON_DEV="push-created-no-commits"
+                  SHOULD_RUN_SONAR="false"
+                  REASON_SONAR="push-created-no-commits (skip sonar)"
+                else
+                  SHOULD_RUN_DEV="true"
+                  REASON_DEV="push-dev-branch"
+                  SHOULD_RUN_SONAR="true"
+                  REASON_SONAR="push-dev-branch"
+                fi
+              else
+                SHOULD_RUN_DEV="false"
+                REASON_DEV="push-not-dev-branch"
+                SHOULD_RUN_SONAR="false"
+                REASON_SONAR="push-not-dev-branch"
+              fi
+            fi
+          fi
+          # PR:
+          # - PR aberta (opened/reopened/synchronize/ready_for_review): roda build (releaseflow.yml) e, opcionalmente, Sonar
+          # - PR mergeada (closed+merged) de bugfix/hotfix -> release/**: promove ambientes
+          if [[ ( "${EVENT}" == "pull_request" || "${EVENT}" == "pull_request_target" ) && "${REASON}" == "not-applicable" ]]; then
+            IS_PR="true"
+            SHOULD_RUN_DEV="false"
+            REASON_DEV="pull-request-use-should-run"
+
+            # ignora bot PRs
+            if [[ "${IGNORE_BOT_PRS}" == "true" ]]; then
+              ACTOR="${GITHUB_ACTOR:-}"
+              PR_USER="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e.get("pull_request",{}).get("user",{}).get("login",""))' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+              if [[ "${ACTOR}" == *"[bot]" || "${PR_USER}" == *"[bot]" || "${ACTOR}" == release-please* || "${PR_USER}" == release-please* ]]; then
+                SHOULD_RUN="false"
+                SHOULD_RUN_SONAR="false"
+                REASON="bot-pr"
+                REASON_SONAR="bot-pr"
+              fi
+            fi
+
+            if [[ "${REASON}" == "not-applicable" ]]; then
+              ACTION="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e.get("action",""))' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+              MERGED="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print("true" if e.get("pull_request",{}).get("merged") else "false")' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+              PR_HEAD="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); print(e.get("pull_request",{}).get("head",{}).get("ref",""))' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+
+              if [[ "${ACTION}" != "closed" ]]; then
+                # PR aberta => permite rodar o releaseflow.yml (ele fará só build, não promove)
+                SHOULD_RUN="true"
+                REASON="pr-open"
+
+                # Sonar: só em PRs abertas de feature/bugfix/hotfix
+                if [[ "${PR_HEAD}" == ${FEATURE_PREFIX}* || "${PR_HEAD}" == ${BUGFIX_PREFIX}* || "${PR_HEAD}" == ${HOTFIX_PREFIX}* ]]; then
+                  SHOULD_RUN_SONAR="true"
+                  REASON_SONAR="pr-open"
+                else
+                  SHOULD_RUN_SONAR="false"
+                  REASON_SONAR="pr-open-not-feature-bugfix-hotfix"
+                fi
+              else
+                # PR fechada
+                SHOULD_RUN_SONAR="false"
+                REASON_SONAR="pr-closed"
+
+                # Só promove quando mergeou bugfix/hotfix em release/**
+                if [[ "${BASE_BRANCH}" == ${RELEASE_PREFIX}* && "${MERGED}" == "true" ]]; then
+                  if [[ "${PR_HEAD}" == ${BUGFIX_PREFIX}* || "${PR_HEAD}" == ${HOTFIX_PREFIX}* ]]; then
+                    IS_RELEASE_PR_MERGED="true"
+                    SHOULD_RUN="true"
+                    REASON="pr-merged-into-release:${PR_HEAD}"
+                  else
+                    SHOULD_RUN="false"
+                    REASON="pr-merged-into-release-but-not-bugfix-hotfix:${PR_HEAD}"
+                  fi
+                else
+                  SHOULD_RUN="false"
+                  REASON="pr-not-merged-into-release"
+                fi
+              fi
+            fi
+          fi
+          fi
+
+          echo "should_run=${SHOULD_RUN}" >> "$GITHUB_OUTPUT"
+          echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+          echo "is_pr=${IS_PR}" >> "$GITHUB_OUTPUT"
+          echo "is_release_create=${IS_RELEASE_CREATE}" >> "$GITHUB_OUTPUT"
+          echo "is_release_push=${IS_RELEASE_PUSH}" >> "$GITHUB_OUTPUT"
+          echo "is_release_pr_merged=${IS_RELEASE_PR_MERGED}" >> "$GITHUB_OUTPUT"
+          echo "should_run_sonar=${SHOULD_RUN_SONAR}" >> "$GITHUB_OUTPUT"
+          echo "reason_sonar=${REASON_SONAR}" >> "$GITHUB_OUTPUT"
+          echo "should_run_dev=${SHOULD_RUN_DEV}" >> "$GITHUB_OUTPUT"
+          echo "reason_dev=${REASON_DEV}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Rules 🛡️
+        id: validate
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOTFIX_TAG_REGEX: ${{ inputs.hotfix_tag_regex }}
+          MAIN_BRANCH: ${{ inputs.main_branch }}
+          RELEASE_PREFIX: ${{ inputs.release_prefix }}
+          FEATURE_PREFIX: ${{ inputs.feature_prefix }}
+          BUGFIX_PREFIX: ${{ inputs.bugfix_prefix }}
+          HOTFIX_PREFIX: ${{ inputs.hotfix_prefix }}
+          # evento "real" do caller (push/pr/create), e não workflow_call
+          TRIGGER_EVENT_NAME: ${{ inputs.trigger_event_name }}
+          # boolean -> string garantida
+          PUSH_CREATED: ${{ inputs.push_created && 'true' || 'false' }}
+
+        run: |
+          set -euo pipefail
+
+          ok="true"
+          report=""
+
+          add() { report+="$1"$'\n'; echo "$1"; }
+          fail() { ok="false"; add "❌ $1"; }
+
+          write_outputs() {
+            {
+              echo "ok=${ok}"
+              echo "report<<EOF"
+              printf '%s' "${report}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          }
+          trap write_outputs EXIT
+
+          # ------------------------------------------------------------
+          # CONTEXTO (recalculado aqui mesmo)
+          # ------------------------------------------------------------
+          EVENT="${TRIGGER_EVENT_NAME:-}"
+          [[ -z "${EVENT}" ]] && EVENT="${GITHUB_EVENT_NAME:-}"
+
+          HEAD_BRANCH=""
+          BASE_BRANCH=""
+
+          if [[ "${EVENT}" == "pull_request" || "${EVENT}" == "pull_request_target" ]]; then
+            HEAD_BRANCH="${GITHUB_HEAD_REF:-}"
+            BASE_BRANCH="${GITHUB_BASE_REF:-}"
+          else
+            HEAD_BRANCH="${GITHUB_REF_NAME:-}"
+            BASE_BRANCH=""
+          fi
+
+          BRANCH_TYPE="other"
+          if [[ "${HEAD_BRANCH}" == release-please--* || "${HEAD_BRANCH}" == release-please-* || "${HEAD_BRANCH}" == dependabot/* ]]; then
+            BRANCH_TYPE="automation"
+          elif [[ "${HEAD_BRANCH}" == "${FEATURE_PREFIX}"* ]]; then
+            BRANCH_TYPE="feature"
+          elif [[ "${HEAD_BRANCH}" == "${BUGFIX_PREFIX}"* ]]; then
+            BRANCH_TYPE="bugfix"
+          elif [[ "${HEAD_BRANCH}" == "${HOTFIX_PREFIX}"* ]]; then
+            BRANCH_TYPE="hotfix"
+          elif [[ "${HEAD_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            BRANCH_TYPE="release"
+          fi
+
+          add "### Contexto 📝"
+          add "- event: \`${EVENT}\`"
+          add "- head: \`${HEAD_BRANCH}\`"
+          add "- type: \`${BRANCH_TYPE}\`"
+          add "- push_created: \`${PUSH_CREATED}\`"
+          add ""
+
+          # Automation: não bloquear
+          if [[ "${BRANCH_TYPE}" == "automation" ]]; then
+            add "✅ Automation detectada — validações ignoradas."
+          else
+            compare_with() {
+              local base_ref="$1"
+              local mb ahead behind
+              mb="$(git merge-base HEAD "$base_ref" 2>/dev/null || true)"
+              ahead="$(git rev-list --count "${base_ref}..HEAD" 2>/dev/null || echo 0)"
+              behind="$(git rev-list --count "HEAD..${base_ref}" 2>/dev/null || echo 0)"
+              echo "${ahead} ${behind} ${mb}"
+            }
+
+            best_release_ancestor() {
+              # Retorna a melhor origin/release/** que seja ancestral do HEAD (menor ahead)
+              local best=""
+              local best_ahead=999999
+              local ahead
+
+              while read -r rb; do
+                [[ -z "$rb" ]] && continue
+                # rb já vem no formato origin/release/...
+                if git merge-base --is-ancestor "$rb" HEAD 2>/dev/null; then
+                  ahead="$(git rev-list --count "${rb}..HEAD" 2>/dev/null || echo 999999)"
+                  [[ "${ahead}" =~ ^[0-9]+$ ]] || ahead=999999
+                  if (( ahead < best_ahead )); then
+                    best_ahead=$ahead
+                    best=$rb
+                  fi
+                fi
+              done < <(git for-each-ref --format='%(refname:short)' "refs/remotes/origin/${RELEASE_PREFIX}*" 2>/dev/null || true)
+
+              [[ -n "${best}" ]] && echo "${best}"
+              return 0
+            }
+
+            nearest_tag_by_regex() {
+              # Retorna "<tag> <dist>" (dist = commits de tag..HEAD) para a TAG mais próxima que casar com HOTFIX_TAG_REGEX
+              local best_tag=""
+              local best_dist=999999
+              local dist
+
+              while read -r t; do
+                [[ -z "$t" ]] && continue
+                if [[ "$t" =~ ${HOTFIX_TAG_REGEX} ]]; then
+                  if git merge-base --is-ancestor "$t" HEAD 2>/dev/null; then
+                    dist="$(git rev-list --count "${t}..HEAD" 2>/dev/null || echo 999999)"
+                    [[ "${dist}" =~ ^[0-9]+$ ]] || dist=999999
+                    if (( dist < best_dist )); then
+                      best_dist=$dist
+                      best_tag=$t
+                    fi
+                  fi
+                fi
+              done < <(git tag --list 2>/dev/null || true)
+
+              if [[ -n "${best_tag}" ]]; then
+                echo "${best_tag} ${best_dist}"
+              fi
+              return 0
+            }
+
+            case "${BRANCH_TYPE}" in
+              feature)
+                # Origem (best-effort): feature/** deve vir da main
+                if [[ "${EVENT}" == "create" || "${EVENT}" == "push" ]]; then
+                  if [[ "${EVENT}" == "push" && "${HEAD_BRANCH}" != ${FEATURE_PREFIX}* ]]; then
+                    : # ignora
+                  else
+                    add "ℹ️ Origem (best-effort) — feature/** deve ser criada a partir de \`${MAIN_BRANCH}\`."
+                    if git show-ref --verify --quiet "refs/remotes/origin/${MAIN_BRANCH}"; then
+                      if git merge-base --is-ancestor "origin/${MAIN_BRANCH}" HEAD 2>/dev/null; then
+                        read -r AHEAD BEHIND MB < <(compare_with "origin/${MAIN_BRANCH}")
+                        add "✅ \`${MAIN_BRANCH}\` é ancestral do HEAD (best-effort)."
+                        add "ℹ️ vs \`${MAIN_BRANCH}\`: ahead=${AHEAD}, behind=${BEHIND}, merge-base=${MB:0:7}"
+
+                        MAIN_TIP="$(git rev-parse "origin/${MAIN_BRANCH}" 2>/dev/null || true)"
+                        if [[ -n "${MB}" && -n "${MAIN_TIP}" && "${MB}" == "${MAIN_TIP}" && "${BEHIND}" == "0" ]]; then
+                          add "✅ Parece criada do tip de \`${MAIN_BRANCH}\` (best-effort)."
+                        else
+                          add "ℹ️ Não dá para cravar o commit exato de origem (main pode ter avançado / branch pode ter sido criada de um commit mais antigo)."
+                        fi
+
+                        # se alguma release/** for ancestral, pode indicar criação a partir de release/** (ou sync já aplicado)
+                        rb="$(best_release_ancestor || true)"
+                        if [[ -n "${rb}" && -n "${MAIN_TIP}" && "${MB}" != "${MAIN_TIP}" ]]; then
+                          add "ℹ️ Observação: \`${rb}\` também é ancestral do HEAD (pode indicar origem em release/** se não houve sync)."
+                        fi
+                      else
+                        fail "feature/** deve ser criada a partir de \`${MAIN_BRANCH}\` (best-effort). \`${MAIN_BRANCH}\` não é ancestral do HEAD."
+                      fi
+                    else
+                      add "ℹ️ Não foi possível comparar: origin/${MAIN_BRANCH} não encontrado no fetch."
+                    fi
+                    add ""
+                  fi
+                fi
+
+                # PR: somente main ou outra feature
+                if [[ "${EVENT}" == "pull_request" || "${EVENT}" == "pull_request_target" ]]; then
+                  if [[ "${BASE_BRANCH}" != "${MAIN_BRANCH}" && "${BASE_BRANCH}" != ${FEATURE_PREFIX}* ]]; then
+                    fail "PR de feature/** só pode ter base \`${MAIN_BRANCH}\` ou \`${FEATURE_PREFIX}**\` (base atual: ${BASE_BRANCH})."
+                  else
+                    add "✅ PR feature/** base permitida."
+                  fi
+                fi
+                ;;
+              bugfix)
+                # Origem (best-effort): bugfix/** deve vir de release/**
+                if [[ "${EVENT}" == "create" || "${EVENT}" == "push" ]]; then
+                  if [[ "${EVENT}" == "push" && "${HEAD_BRANCH}" != ${BUGFIX_PREFIX}* ]]; then
+                    : # ignora
+                  else
+                    add "ℹ️ Origem (best-effort) — bugfix/** deve ser criada a partir de \`${RELEASE_PREFIX}**\`."
+                    rb="$(best_release_ancestor || true)"
+                    if [[ -n "${rb}" ]]; then
+                      read -r AHEAD BEHIND MB < <(compare_with "${rb}")
+                      add "✅ Release candidata detectada: \`${rb}\` (best-effort)."
+                      add "ℹ️ vs \`${rb}\`: ahead=${AHEAD}, behind=${BEHIND}, merge-base=${MB:0:7}"
+                    else
+                      fail "bugfix/** deve ser criada a partir de \`${RELEASE_PREFIX}**\` (best-effort não encontrou release/** ancestral)."
+                    fi
+                    add ""
+                  fi
+                fi
+
+                # PR: somente release/**
+                if [[ "${EVENT}" == "pull_request" || "${EVENT}" == "pull_request_target" ]]; then
+                  [[ "${BASE_BRANCH}" == ${RELEASE_PREFIX}* ]] || fail "PR de bugfix/** só pode ter base \`${RELEASE_PREFIX}**\`."
+                  [[ "${ok}" == "true" ]] && add "✅ PR bugfix/** base permitida."
+                fi
+                ;;
+              hotfix)
+                # Origem (best-effort): hotfix/** deve vir de TAG (semver)
+                if [[ "${EVENT}" == "create" || "${EVENT}" == "push" ]]; then
+                  if [[ "${EVENT}" == "push" && "${HEAD_BRANCH}" != ${HOTFIX_PREFIX}* ]]; then
+                    : # ignora
+                  else
+                    add "ℹ️ Origem (best-effort) — hotfix/** deve ser criada a partir de TAG (regex: \`${HOTFIX_TAG_REGEX}\`)."
+                    read -r TAG DIST < <(nearest_tag_by_regex || true)
+
+                    if [[ -n "${TAG:-}" ]]; then
+                      add "✅ TAG mais próxima compatível: \`${TAG}\` (distância: ${DIST})."
+                      if [[ "${DIST}" == "0" ]]; then
+                        add "✅ Parece criada diretamente da TAG \`${TAG}\` (best-effort)."
+                      else
+                        add "ℹ️ HEAD possui commits após a TAG (ok após o primeiro commit)."
+                      fi
+                    else
+                      fail "hotfix/** deve ter origem em TAG (semver). Não encontrei TAG compatível no histórico."
+                    fi
+                    add ""
+                  fi
+                fi
+
+                # PR: somente release/**
+                if [[ "${EVENT}" == "pull_request" || "${EVENT}" == "pull_request_target" ]]; then
+                  [[ "${BASE_BRANCH}" == ${RELEASE_PREFIX}* ]] || fail "PR de hotfix/** só pode ter base \`${RELEASE_PREFIX}**\`."
+                  [[ "${ok}" == "true" ]] && add "✅ PR hotfix/** base permitida."
+                fi
+                ;;
+              release)
+                # Origem (best-effort): release/** deve vir da main
+                # Observação: release/** também pode ser criada a partir de TAG (para cenários de hotfix),
+                # mas nesse caso NÃO deve iniciar o flow (isso é decisão do Guard).
+                if [[ "${EVENT}" == "create" || ("${EVENT}" == "push" && "${HEAD_BRANCH}" == ${RELEASE_PREFIX}* && "${PUSH_CREATED}" == "true") ]]; then
+                  add "ℹ️ Origem (best-effort) — release/** deve ser criada a partir de \`${MAIN_BRANCH}\` (ou TAG semver em caso de hotfix)."
+
+                  read -r TAG DIST < <(nearest_tag_by_regex || true)
+                  if [[ -n "${TAG:-}" && "${DIST:-}" == "0" ]]; then
+                    add "✅ Release criada a partir de TAG \`${TAG}\` (best-effort) — permitido, mas **não deve iniciar o flow**."
+                    add ""
+                  else
+                    if git show-ref --verify --quiet "refs/remotes/origin/${MAIN_BRANCH}"; then
+                      if git merge-base --is-ancestor "origin/${MAIN_BRANCH}" HEAD 2>/dev/null; then
+                        read -r AHEAD BEHIND MB < <(compare_with "origin/${MAIN_BRANCH}")
+                        add "✅ \`${MAIN_BRANCH}\` é ancestral do HEAD (best-effort)."
+                        add "ℹ️ vs \`${MAIN_BRANCH}\`: ahead=${AHEAD}, behind=${BEHIND}, merge-base=${MB:0:7}"
+                      else
+                        fail "release/** deve ser criada a partir de \`${MAIN_BRANCH}\` (best-effort), exceto quando criada diretamente de TAG semver."
+                      fi
+                    else
+                      add "ℹ️ Não foi possível comparar: origin/${MAIN_BRANCH} não encontrado no fetch."
+                    fi
+                    add ""
+                  fi
+                fi
+
+                # PR (head=release/**): somente para main
+                if [[ "${EVENT}" == "pull_request" || "${EVENT}" == "pull_request_target" ]]; then
+                  [[ "${BASE_BRANCH}" == "${MAIN_BRANCH}" ]] || fail "PR de release/** só pode ter base \`${MAIN_BRANCH}\`."
+                  [[ "${ok}" == "true" ]] && add "✅ PR release/** base permitida."
+                fi
+
+                # push em release/**: permitido SOMENTE se veio de merge de PR bugfix/hotfix ou automation
+                if [[ "${EVENT}" == "push" && "${HEAD_BRANCH}" == ${RELEASE_PREFIX}* ]]; then
+                  if [[ "${PUSH_CREATED}" == "true" ]]; then
+                    add "ℹ️ Push de criação da release/** — ok."
+                  else
+                    prs_json="$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json"                       "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" || true)"
+                    pr_number="$(python3 -c 'import json,sys; d=json.loads(sys.stdin.read() or "[]"); print(d[0]["number"] if d else "")' <<< "${prs_json}" 2>/dev/null || true)"
+
+                    if [[ -z "${pr_number}" ]]; then
+                      fail "Push direto em release/** não permitido. Apenas merges via PR (bugfix/hotfix/automation)."
+                    else
+                      pr="$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json"                         "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" || true)"
+                      pr_base="$(python3 -c 'import json,sys; e=json.loads(sys.stdin.read()); print(e.get("base",{}).get("ref",""))' <<< "${pr}" 2>/dev/null || true)"
+                      pr_head="$(python3 -c 'import json,sys; e=json.loads(sys.stdin.read()); print(e.get("head",{}).get("ref",""))' <<< "${pr}" 2>/dev/null || true)"
+
+                      add "ℹ️ Push associado ao PR #${pr_number} (head=\`${pr_head}\` -> base=\`${pr_base}\`)."
+
+                      # Exceção: "Update branch" do PR de sync (release/** -> main) cria um merge commit no HEAD (release/**).
+                      # Isso gera um evento de push em release/** associado a um PR cujo base é MAIN.
+                      # Não deve falhar a validação; apenas não deve iniciar o flow.
+                      if [[ "${pr_head}" == "${HEAD_BRANCH}" && "${pr_base}" == "${MAIN_BRANCH}" ]]; then
+                        add "✅ Push em release/** vindo de 'Update branch' do PR de sync (release → main) — permitido (não inicia o flow)."
+                      else
+                      if [[ "${pr_base}" != ${RELEASE_PREFIX}* ]]; then
+                        fail "Push em release/** veio de PR que não tem base release/** (base=${pr_base})."
+                      fi
+
+                      if [[ "${pr_head}" == ${BUGFIX_PREFIX}* || "${pr_head}" == ${HOTFIX_PREFIX}* || "${pr_head}" == release-please--* || "${pr_head}" == release-please-* || "${pr_head}" == dependabot/* ]]; then
+                        add "✅ Push em release/** veio de PR permitido (bugfix/hotfix/automation)."
+                      else
+                        fail "Push em release/** veio de PR não permitido (head=${pr_head})."
+                      fi
+                      fi
+                    fi
+                  fi
+                fi
+                ;;
+              *)
+                add "ℹ️ Sem regras específicas para type=\`${BRANCH_TYPE}\`."
+                ;;
+            esac
+          fi
+
+          {
+            echo "# Guard Summary 🛡"
+            echo ""
+            echo "${report}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: Summary 📌
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "- success_ok: \`${{ steps.validate.outputs.ok }}\`"
+            echo "- should_run: \`${{ steps.guard.outputs.should_run }}\`"
+            echo "- should_run_sonar: \`${{ steps.guard.outputs.should_run_sonar }}\`"
+            echo "- reason_sonar: \`${{ steps.guard.outputs.reason_sonar }}\`"
+            echo "- should_run_dev: \`${{ steps.guard.outputs.should_run_dev }}\`"
+            echo "- reason_dev: \`${{ steps.guard.outputs.reason_dev }}\`"
+            echo "- reason: \`${{ steps.guard.outputs.reason }}\`"
+            echo "- is_release_create: \`${{ steps.guard.outputs.is_release_create }}\`"
+            echo "- is_release_push: \`${{ steps.guard.outputs.is_release_push }}\`"
+            echo "- is_release_pr_merged: \`${{ steps.guard.outputs.is_release_pr_merged }}\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if invalid ❌
+        if: ${{ steps.validate.outputs.ok != 'true' }}
+        run: exit 1
