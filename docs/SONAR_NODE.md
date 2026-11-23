@@ -264,7 +264,7 @@ Use `sonar_extra_args` com `-D...` adicionais.
 ```yaml
 jobs:
   sonar:
-    uses: mrrdev4/shared-workflows/.github/workflows/sonar-node.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/sonar-node.yml@<ref>
     secrets: inherit
     with:
       runs_on: '["self-hosted","dev"]'

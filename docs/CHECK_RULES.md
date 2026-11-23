@@ -399,7 +399,7 @@ exit 1
 jobs:
   guard:
     name: Guard 🛡️
-    uses: mrrdev4/shared-workflows/.github/workflows/check-rules.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/check-rules.yml@<ref>
     secrets: inherit
     with:
       runs_on: '["self-hosted","dev"]'
@@ -420,7 +420,7 @@ E usar as decisões:
   releaseflow:
     needs: [guard]
     if: ${{ needs.guard.outputs.should_run == 'true' }}
-    uses: mrrdev4/shared-workflows/.github/workflows/releaseflow.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/releaseflow.yml@<ref>
     secrets: inherit
 ```
 
@@ -428,7 +428,7 @@ E usar as decisões:
   sonar:
     needs: [guard]
     if: ${{ needs.guard.outputs.should_run_sonar == 'true' }}
-    uses: mrrdev4/shared-workflows/.github/workflows/sonar-<lang>.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/sonar-<lang>.yml@<ref>
     secrets: inherit
 ```
 

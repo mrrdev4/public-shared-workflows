@@ -126,5 +126,5 @@ permissions:
 
 jobs:
   pr_validation:
-    uses: mrrdev4/shared-workflows/.github/workflows/pr-validation.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/pr-validation.yml@<ref>
 ```

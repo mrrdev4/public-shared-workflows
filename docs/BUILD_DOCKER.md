@@ -182,7 +182,7 @@ Não. O workflow usa **Workload Identity Federation** via `google-github-actions
 ```yaml
 jobs:
   build:
-    uses: mrrdev4/shared-workflows/.github/workflows/build-docker.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/build-docker.yml@<ref>
     secrets: inherit
     with:
       runs_on: '["self-hosted","dev"]'
@@ -203,7 +203,7 @@ jobs:
 ```yaml
 jobs:
   build:
-    uses: mrrdev4/shared-workflows/.github/workflows/build-docker.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/build-docker.yml@<ref>
     secrets: inherit
     with:
       runs_on: '["self-hosted","dev"]'
@@ -224,7 +224,7 @@ jobs:
 ```yaml
 jobs:
   build:
-    uses: mrrdev4/shared-workflows/.github/workflows/build-docker.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/build-docker.yml@<ref>
     secrets: inherit
     with:
       runs_on: '["self-hosted","dev"]'

@@ -274,7 +274,7 @@ Não precisa mudar nada: o workflow detecta automaticamente pelo lockfile.
 ```yaml
 jobs:
   sonar:
-    uses: mrrdev4/shared-workflows/.github/workflows/sonar-react.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/sonar-react.yml@<ref>
     secrets: inherit
     with:
       runs_on: '["self-hosted","dev"]'

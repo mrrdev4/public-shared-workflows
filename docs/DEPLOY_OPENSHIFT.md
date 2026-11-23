@@ -231,7 +231,7 @@ Confirme `OC_SERVER` e `OC_TOKEN` no **Environment** que você passou em `inputs
 ```yaml
 jobs:
   deploy:
-    uses: mrrdev4/shared-workflows/.github/workflows/deploy-helm-openshift.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/deploy-helm-openshift.yml@<ref>
     secrets: inherit
     with:
       environment: dev
@@ -247,7 +247,7 @@ jobs:
 ```yaml
 jobs:
   deploy:
-    uses: mrrdev4/shared-workflows/.github/workflows/deploy-helm-openshift.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/deploy-helm-openshift.yml@<ref>
     secrets: inherit
     with:
       environment: ti
@@ -264,7 +264,7 @@ jobs:
 ```yaml
 jobs:
   deploy:
-    uses: mrrdev4/shared-workflows/.github/workflows/deploy-helm-openshift.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/deploy-helm-openshift.yml@<ref>
     secrets: inherit
     with:
       environment: trg

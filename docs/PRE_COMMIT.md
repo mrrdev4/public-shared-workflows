@@ -106,7 +106,7 @@ Troque os `@latest` por versões específicas (ex.: `@v0.6.0`) para estabilidade
 ```yaml
 jobs:
   pre_commit:
-    uses: mrrdev4/shared-workflows/.github/workflows/pre-commit.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/pre-commit.yml@<ref>
     with:
       go-version: "1.24.5"
       node-version: "22"

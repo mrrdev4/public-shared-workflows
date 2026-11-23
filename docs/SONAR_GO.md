@@ -269,7 +269,7 @@ Use `sonar_extra_args` com `-D...` extras.
 ```yaml
 jobs:
   sonar:
-    uses: mrrdev4/shared-workflows/.github/workflows/sonar-go.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/sonar-go.yml@<ref>
     secrets: inherit
     with:
       runs_on: '["self-hosted","dev"]'

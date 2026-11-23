@@ -189,7 +189,7 @@ Chama o reusable workflow `build-docker.yml` para buildar e fazer push da imagem
 
 | # | Step | Condição (`if`) | Detalhes |
 |---:|---|---|---|
-| 1 | Call reusable workflow (`uses:`) | `N/A` | Encaminha inputs/secrets para `mrrdev4/shared-workflows/.github/workflows/build-docker.yml@main`. Steps internos estão documentados no workflow chamado. |
+| 1 | Call reusable workflow (`uses:`) | `N/A` | Encaminha inputs/secrets para `mrrdev4/publlic-shared-workflows/.github/workflows/build-docker.yml@main`. Steps internos estão documentados no workflow chamado. |
 
 ---
 
@@ -238,7 +238,7 @@ Deploy em TI usando **imagem por digest** (`needs.resolve_digest.outputs.image_b
 
 | # | Step | Condição (`if`) | Detalhes |
 |---:|---|---|---|
-| 1 | Call reusable workflow (`uses:`) | `N/A` | Encaminha inputs/secrets para `mrrdev4/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main`. Steps internos estão documentados no workflow chamado. |
+| 1 | Call reusable workflow (`uses:`) | `N/A` | Encaminha inputs/secrets para `mrrdev4/publlic-shared-workflows/.github/workflows/deploy-helm-openshift.yml@main`. Steps internos estão documentados no workflow chamado. |
 
 ---
 
@@ -255,7 +255,7 @@ Deploy em TRG usando **imagem por digest** via `deploy-helm-openshift.yml`.
 
 | # | Step | Condição (`if`) | Detalhes |
 |---:|---|---|---|
-| 1 | Call reusable workflow (`uses:`) | `N/A` | Encaminha inputs/secrets para `mrrdev4/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main`. Steps internos estão documentados no workflow chamado. |
+| 1 | Call reusable workflow (`uses:`) | `N/A` | Encaminha inputs/secrets para `mrrdev4/publlic-shared-workflows/.github/workflows/deploy-helm-openshift.yml@main`. Steps internos estão documentados no workflow chamado. |
 
 ---
 
@@ -325,7 +325,7 @@ Deploy em PRD usando a **tag SemVer** (`needs.retag_release_image.outputs.image_
 
 | # | Step | Condição (`if`) | Detalhes |
 |---:|---|---|---|
-| 1 | Call reusable workflow (`uses:`) | `N/A` | Encaminha inputs/secrets para `mrrdev4/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main`. Steps internos estão documentados no workflow chamado. |
+| 1 | Call reusable workflow (`uses:`) | `N/A` | Encaminha inputs/secrets para `mrrdev4/publlic-shared-workflows/.github/workflows/deploy-helm-openshift.yml@main`. Steps internos estão documentados no workflow chamado. |
 
 ---
 
@@ -422,7 +422,7 @@ concurrency:
 
 jobs:
   releaseflow:
-    uses: mrrdev4/shared-workflows/.github/workflows/releaseflow.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/releaseflow.yml@<ref>
     secrets: inherit
     with:
       runs_on: '["self-hosted","dev"]'

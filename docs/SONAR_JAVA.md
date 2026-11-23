@@ -359,7 +359,7 @@ O workflow falha de propósito.
 ```yaml
 jobs:
   sonar:
-    uses: mrrdev4/shared-workflows/.github/workflows/sonar-java.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/sonar-java.yml@<ref>
     secrets: inherit
     with:
       runs_on: '["self-hosted","dev"]'
@@ -384,7 +384,7 @@ jobs:
 ```yaml
 jobs:
   sonar:
-    uses: mrrdev4/shared-workflows/.github/workflows/sonar-java.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/sonar-java.yml@<ref>
     secrets: inherit
     with:
       runs_on: '["self-hosted","dev"]'
@@ -403,7 +403,7 @@ jobs:
 ```yaml
 jobs:
   sonar:
-    uses: mrrdev4/shared-workflows/.github/workflows/sonar-java.yml@<ref>
+    uses: mrrdev4/publlic-shared-workflows/.github/workflows/sonar-java.yml@<ref>
     secrets: inherit
     with:
       runs_on: '["self-hosted","dev"]'
