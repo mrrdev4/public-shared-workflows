@@ -213,7 +213,7 @@ jobs:
           else
             echo "tool=pip" >> "$GITHUB_OUTPUT"
           fi
-      
+
 
       # Opcional. Desabilitado por padrão para evitar erro em RHEL self-hosted:
       # "The version 'X' with architecture 'x64' was not found for RedHatEnterprise..."
@@ -275,7 +275,7 @@ jobs:
           echo "PYTHON_BIN=${selected}" >> "$GITHUB_ENV"
 
           "${selected}" --version
-          "${selected}" -m pip --version || true          
+          "${selected}" -m pip --version || true
 
       - name: Install Deps (Uv) ⚡
         if: steps.py.outputs.tool == 'uv'
