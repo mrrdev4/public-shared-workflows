@@ -107,15 +107,15 @@ on:
         default: ""
 
       # ---- Deploys VM GCP ----
-      enable_deploy_dev:
-        type: string
-        required: false
-        default: "true"
       enable_deploy_ti:
         type: string
         required: false
         default: "true"
       enable_deploy_trg:
+        type: string
+        required: false
+        default: "true"
+      enable_deploy_hml:
         type: string
         required: false
         default: "true"
@@ -136,16 +136,15 @@ on:
         type: string
         required: false
         default: "Trg"
+      environment_hml:
+        type: string
+        required: false
+        default: "Hml"
       environment_prd:
         type: string
         required: false
         default: "Prd"
 
-      runs_on_dev:
-        description: "Runner da VM DEV (vazio => usa inputs.runs_on)"
-        type: string
-        required: false
-        default: '{"group":"devops-sre","labels":["self-hosted","devops-sre-DEV"]}'
       runs_on_ti:
         description: "Runner da VM TI (vazio => usa inputs.runs_on)"
         type: string
@@ -153,6 +152,11 @@ on:
         default: ""
       runs_on_trg:
         description: "Runner da VM TRG (vazio => usa inputs.runs_on)"
+        type: string
+        required: false
+        default: ""
+      runs_on_hml:
+        description: "Runner da VM HML (vazio => usa inputs.runs_on)"
         type: string
         required: false
         default: ""
@@ -168,17 +172,6 @@ on:
         type: string
         required: false
         default: "devops-sre"
-
-      multi_vm_dev:
-        description: "true => deploy DEV em várias VMs (usa vms_dev). false => usa runs_on_dev"
-        type: boolean
-        required: false
-        default: false
-      vms_dev:
-        description: 'Lista JSON de labels de runners DEV. Ex.: ["vm-dev-1","vm-dev-2"]'
-        type: string
-        required: false
-        default: ""
 
       multi_vm_ti:
         description: "true => deploy TI em várias VMs (usa vms_ti). false => usa runs_on_ti"
@@ -198,6 +191,17 @@ on:
         default: false
       vms_trg:
         description: 'Lista JSON de labels de runners TRG. Ex.: ["vm-trg-1","vm-trg-2"]'
+        type: string
+        required: false
+        default: ""
+
+      multi_vm_hml:
+        description: "true => deploy HML em várias VMs (usa vms_hml). false => usa runs_on_hml"
+        type: boolean
+        required: false
+        default: false
+      vms_hml:
+        description: 'Lista JSON de labels de runners HML. Ex.: ["vm-hml-1","vm-hml-2"]'
         type: string
         required: false
         default: ""
@@ -269,9 +273,9 @@ jobs:
       should_run_release_please_pr: ${{ steps.ctx.outputs.should_run_release_please_pr }}
       should_run_release_please_publish: ${{ steps.ctx.outputs.should_run_release_please_publish }}
 
-      vms_dev: ${{ steps.vms.outputs.vms_dev }}
       vms_ti: ${{ steps.vms.outputs.vms_ti }}
       vms_trg: ${{ steps.vms.outputs.vms_trg }}
+      vms_hml: ${{ steps.vms.outputs.vms_hml }}
       vms_prd: ${{ steps.vms.outputs.vms_prd }}
 
     steps:
@@ -438,12 +442,12 @@ jobs:
       - name: Resolve VM Matrix 🖥️
         id: vms
         env:
-          MULTI_DEV: ${{ inputs.multi_vm_dev }}
-          LIST_DEV: ${{ inputs.vms_dev }}
           MULTI_TI: ${{ inputs.multi_vm_ti }}
           LIST_TI: ${{ inputs.vms_ti }}
           MULTI_TRG: ${{ inputs.multi_vm_trg }}
           LIST_TRG: ${{ inputs.vms_trg }}
+          MULTI_HML: ${{ inputs.multi_vm_hml }}
+          LIST_HML: ${{ inputs.vms_hml }}
           MULTI_PRD: ${{ inputs.multi_vm_prd }}
           LIST_PRD: ${{ inputs.vms_prd }}
         run: |
@@ -483,15 +487,15 @@ jobs:
           PY
           }
 
-          VMS_DEV="$(resolve_vms dev "${MULTI_DEV}" "${LIST_DEV}")"
           VMS_TI="$(resolve_vms ti "${MULTI_TI}" "${LIST_TI}")"
           VMS_TRG="$(resolve_vms trg "${MULTI_TRG}" "${LIST_TRG}")"
+          VMS_HML="$(resolve_vms hml "${MULTI_HML}" "${LIST_HML}")"
           VMS_PRD="$(resolve_vms prd "${MULTI_PRD}" "${LIST_PRD}")"
 
           {
-            echo "vms_dev=${VMS_DEV}"
             echo "vms_ti=${VMS_TI}"
             echo "vms_trg=${VMS_TRG}"
+            echo "vms_hml=${VMS_HML}"
             echo "vms_prd=${VMS_PRD}"
           } >> "$GITHUB_OUTPUT"
 
@@ -505,7 +509,7 @@ jobs:
         needs.ctx.outputs.is_dev_flow == 'true' &&
         needs.ctx.result == 'success'
       }}
-    uses: mrrdev4/public-shared-workflows/.github/workflows/build-maven.yml@feature/add-deploy-vm-gcp
+    uses: V-tal/shared-workflows/.github/workflows/build-maven.yml@feature/add-deploy-vm-gcp
     with:
       runs_on: ${{ inputs.runs_on }}
       environment: ${{ inputs.environment_dev }}
@@ -516,35 +520,6 @@ jobs:
       working_directory: ${{ inputs.working_directory }}
       push_sha_tag: ${{ inputs.push_sha_tag }}
       gcp_maven_repository_url: ${{ inputs.gcp_maven_repository_url }}
-      gcp_workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
-      gcp_service_account: ${{ inputs.gcp_service_account }}
-
-  deploy_dev:
-    name: Deploy DEV ⛵
-    needs: [ctx, build]
-    if: >-
-      ${{
-        inputs.enable_deploy_dev == 'true' &&
-        needs.ctx.outputs.is_dev_flow == 'true' &&
-        needs.build.result == 'success' &&
-        needs.build.outputs.artifact_version != ''
-      }}
-    strategy:
-      fail-fast: true
-      max-parallel: 1
-      matrix:
-        vm: ${{ fromJson(needs.ctx.outputs.vms_dev) }}
-    uses: mrrdev4/public-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
-    with:
-      runs_on: >-
-        ${{ matrix.vm == '__default__'
-            && (inputs.runs_on_dev != '' && inputs.runs_on_dev || inputs.runs_on)
-            || format('{{"group":"{0}","labels":["self-hosted","{1}"]}}', inputs.runner_group, matrix.vm) }}
-      environment: ${{ inputs.environment_dev }}
-      repository_url: ${{ needs.build.outputs.repository_url }}
-      group_id: ${{ needs.build.outputs.group_id }}
-      artifact_id: ${{ needs.build.outputs.artifact_id }}
-      artifact_version: ${{ needs.build.outputs.artifact_version }}
       gcp_workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
       gcp_service_account: ${{ inputs.gcp_service_account }}
 
@@ -814,7 +789,7 @@ jobs:
       max-parallel: 1
       matrix:
         vm: ${{ fromJson(needs.ctx.outputs.vms_ti) }}
-    uses: mrrdev4/public-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    uses: V-tal/shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
     with:
       runs_on: >-
         ${{ matrix.vm == '__default__'
@@ -848,7 +823,7 @@ jobs:
       max-parallel: 1
       matrix:
         vm: ${{ fromJson(needs.ctx.outputs.vms_trg) }}
-    uses: mrrdev4/public-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    uses: V-tal/shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
     with:
       runs_on: >-
         ${{ matrix.vm == '__default__'
@@ -862,10 +837,48 @@ jobs:
       gcp_workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
       gcp_service_account: ${{ inputs.gcp_service_account }}
 
+  deploy_hml:
+    name: Deploy HML 🧯
+    needs: [ctx, resolve_artifact, deploy_ti, deploy_trg]
+    if: >-
+      ${{
+        always() &&
+        inputs.enable_deploy_hml == 'true' &&
+        needs.ctx.outputs.should_run_release_promotion == 'true' &&
+        needs.resolve_artifact.result == 'success' &&
+        needs.resolve_artifact.outputs.artifact_version != '' &&
+        (
+          inputs.enable_deploy_ti != 'true' ||
+          needs.deploy_ti.result == 'success'
+        ) &&
+        (
+          inputs.enable_deploy_trg != 'true' ||
+          needs.deploy_trg.result == 'success'
+        )
+      }}
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        vm: ${{ fromJson(needs.ctx.outputs.vms_hml) }}
+    uses: V-tal/shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    with:
+      runs_on: >-
+        ${{ matrix.vm == '__default__'
+            && (inputs.runs_on_hml != '' && inputs.runs_on_hml || inputs.runs_on)
+            || format('{{"group":"{0}","labels":["self-hosted","{1}"]}}', inputs.runner_group, matrix.vm) }}
+      environment: ${{ inputs.environment_hml }}
+      repository_url: ${{ needs.resolve_artifact.outputs.repository_url }}
+      group_id: ${{ needs.resolve_artifact.outputs.group_id }}
+      artifact_id: ${{ needs.resolve_artifact.outputs.artifact_id }}
+      artifact_version: ${{ needs.resolve_artifact.outputs.artifact_version }}
+      gcp_workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
+      gcp_service_account: ${{ inputs.gcp_service_account }}
+
   release_please_pr:
     name: Release Pull Request 🔗
     environment: Release
-    needs: [ctx, resolve_artifact, deploy_ti, deploy_trg]
+    needs: [ctx, resolve_artifact, deploy_ti, deploy_trg, deploy_hml]
     if: >-
       ${{
         always() &&
@@ -878,6 +891,10 @@ jobs:
         (
           inputs.enable_deploy_trg != 'true' ||
           needs.deploy_trg.result == 'success'
+        ) &&
+        (
+          inputs.enable_deploy_hml != 'true' ||
+          needs.deploy_hml.result == 'success'
         )
       }}
     runs-on: ${{ fromJson(inputs.runs_on) }}
@@ -1155,7 +1172,7 @@ jobs:
         # Serve apenas para criar 1 job por VM (a lista vem de vars.VMS_PRD).
         # Os valores NÃO são usados como label de runner.
         vm: ${{ fromJson(needs.ctx.outputs.vms_prd) }}
-    uses: mrrdev4/public-shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
+    uses: V-tal/shared-workflows/.github/workflows/deploy-vm-gcp.yml@feature/add-deploy-vm-gcp
     with:
       # Sempre usa o label de PRD vindo do caller (runs_on_prd), independente de matrix.vm.
       runs_on: ${{ inputs.runs_on_prd != '' && inputs.runs_on_prd || inputs.runs_on }}
@@ -1247,10 +1264,10 @@ jobs:
       [
         ctx,
         build,
-        deploy_dev,
         resolve_artifact,
         deploy_ti,
         deploy_trg,
+        deploy_hml,
         deploy_prd,
         release_please_pr,
         release_please_publish,
@@ -1311,9 +1328,9 @@ jobs:
 
             echo
             echo "### Environments"
-            echo "- deploy_dev: \`${{ needs.deploy_dev.result || 'skipped' }}\`"
             echo "- deploy_ti: \`${{ needs.deploy_ti.result || 'skipped' }}\`"
             echo "- deploy_trg: \`${{ needs.deploy_trg.result || 'skipped' }}\`"
+            echo "- deploy_hml: \`${{ needs.deploy_hml.result || 'skipped' }}\`"
             echo "- deploy_prd: \`${{ needs.deploy_prd.result || 'skipped' }}\`"
             echo
             echo "### Results"
