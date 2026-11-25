@@ -1,0 +1,298 @@
+
+name: Pre Commit Hooks 🧰
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: 'Go version to use'
+        required: false
+        default: '1.26.0'
+        type: string
+
+      node-version:
+        description: 'Node.js version to use'
+        required: false
+        default: '22'
+        type: string
+
+      python-version:
+        description: 'Python version to use'
+        required: false
+        default: '3.11'
+        type: string
+
+      java-version:
+        description: 'Java version to use'
+        required: false
+        default: '21'
+        type: string
+
+jobs:
+  PreCommitHooks:
+    if: >-
+      ${{
+        github.event_name == 'pull_request' &&
+        !(
+          github.actor == 'dependabot[bot]' ||
+          startsWith(github.head_ref, 'dependabot/') ||
+          startsWith(github.head_ref, 'release-please--') ||
+          startsWith(github.head_ref, 'release/')
+        )
+      }}
+
+    name: Pre Commit Hooks 🧰
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository 📋
+        uses: actions/checkout@v7
+
+      # -------------------------------------------------------
+      # Detect project stack
+      # -------------------------------------------------------
+      - name: Detect Project Stack 🔎
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f .pre-commit-config.yaml ]]; then
+            echo "has_precommit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_precommit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ -f package.json ]]; then
+            echo "is_node=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_node=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Read tracked files once to prevent SIGPIPE
+          # caused by git ls-files | grep -q with pipefail.
+          tracked_files="$(mktemp)"
+          trap 'rm -f "$tracked_files"' EXIT
+
+          git ls-files > "$tracked_files"
+
+          detect_stack() {
+            local output="$1"
+            local pattern="$2"
+
+            if grep -Eq "$pattern" "$tracked_files"; then
+              echo "${output}=true" >> "$GITHUB_OUTPUT"
+              echo "Detected: ${output}=true"
+            else
+              echo "${output}=false" >> "$GITHUB_OUTPUT"
+              echo "Detected: ${output}=false"
+            fi
+          }
+
+          detect_stack is_go \
+            '(^|/)(go\.mod|go\.work)$'
+
+          detect_stack is_python \
+            '(^|/)(pyproject\.toml|requirements\.txt|requirements-dev\.txt|setup\.py|Pipfile)$'
+
+          # Java supports Maven, Gradle and Ant.
+          detect_stack is_java \
+            '(^|/)(pom\.xml|build\.gradle|build\.gradle\.kts|settings\.gradle|settings\.gradle\.kts|mvnw|gradlew|build\.xml)$'
+
+          if [[ -f yarn.lock ]]; then
+            echo "node_pm=yarn" >> "$GITHUB_OUTPUT"
+          elif [[ -f pnpm-lock.yaml ]]; then
+            echo "node_pm=pnpm" >> "$GITHUB_OUTPUT"
+          elif [[ -f package-lock.json ]]; then
+            echo "node_pm=npm" >> "$GITHUB_OUTPUT"
+          else
+            echo "node_pm=none" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -------------------------------------------------------
+      # Go
+      # -------------------------------------------------------
+      - name: Set up Go 🛠️
+        if: steps.detect.outputs.is_go == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: true
+          cache-dependency-path: |
+            **/go.sum
+            **/go.work.sum
+
+      # -------------------------------------------------------
+      # Python / Pre-commit
+      # -------------------------------------------------------
+      - name: Set up Python 🐍
+        if: >-
+          ${{
+            steps.detect.outputs.has_precommit == 'true' ||
+            steps.detect.outputs.is_python == 'true'
+          }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      # -------------------------------------------------------
+      # Node.js
+      # -------------------------------------------------------
+      - name: Enable Corepack
+        if: >-
+          ${{
+            steps.detect.outputs.is_node == 'true' &&
+            (
+              steps.detect.outputs.node_pm == 'yarn' ||
+              steps.detect.outputs.node_pm == 'pnpm'
+            )
+          }}
+        shell: bash
+        run: corepack enable
+
+      - name: Set up Node.js 🟢
+        if: steps.detect.outputs.is_node == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: >-
+            ${{
+              steps.detect.outputs.node_pm == 'yarn' && 'yarn' ||
+              steps.detect.outputs.node_pm == 'npm' && 'npm' ||
+              steps.detect.outputs.node_pm == 'pnpm' && 'pnpm' ||
+              ''
+            }}
+
+      # -------------------------------------------------------
+      # Java
+      # -------------------------------------------------------
+      - name: Set up Java ☕
+        if: steps.detect.outputs.is_java == 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      # -------------------------------------------------------
+      # Node dependencies
+      # -------------------------------------------------------
+      - name: Install Node dependencies 📦
+        if: steps.detect.outputs.is_node == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ steps.detect.outputs.node_pm }}" in
+            yarn)
+              yarn install --immutable
+              ;;
+            pnpm)
+              pnpm install --frozen-lockfile
+              ;;
+            npm)
+              npm ci
+              ;;
+            none)
+              echo "No Node lockfile found. Skipping install."
+              ;;
+          esac
+
+      # -------------------------------------------------------
+      # Java wrappers and diagnostics
+      # -------------------------------------------------------
+      - name: Prepare Java wrappers ☕
+        if: steps.detect.outputs.is_java == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f mvnw ]]; then
+            chmod +x mvnw
+          fi
+
+          if [[ -f gradlew ]]; then
+            chmod +x gradlew
+          fi
+
+          echo "=== Java version ==="
+          java -version
+
+          echo "=== JAVA_HOME ==="
+          echo "$JAVA_HOME"
+
+          if [[ -f pom.xml ]]; then
+            echo "=== Maven version ==="
+            mvn -version
+          fi
+
+      # -------------------------------------------------------
+      # Go tooling
+      # -------------------------------------------------------
+      - name: Install Go tools 🔧
+        if: steps.detect.outputs.is_go == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          go install github.com/lietu/go-pre-commit@latest
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+          go install github.com/kisielk/errcheck@latest
+          go install mvdan.cc/gofumpt@latest
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      # -------------------------------------------------------
+      # Stack summary
+      # -------------------------------------------------------
+      - name: Stack Detection Summary 📊
+        if: always() && steps.detect.outcome == 'success'
+        shell: bash
+        env:
+          IS_GO: ${{ steps.detect.outputs.is_go }}
+          IS_PYTHON: ${{ steps.detect.outputs.is_python }}
+          IS_NODE: ${{ steps.detect.outputs.is_node }}
+          IS_JAVA: ${{ steps.detect.outputs.is_java }}
+          NODE_PM: ${{ steps.detect.outputs.node_pm }}
+          HAS_PRECOMMIT: ${{ steps.detect.outputs.has_precommit }}
+          JAVA_VERSION: ${{ inputs.java-version }}
+          GO_VERSION: ${{ inputs.go-version }}
+          NODE_VERSION: ${{ inputs.node-version }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+        run: |
+          {
+            echo "## 🧰 Pre-commit Stack Detection"
+            echo ""
+            echo "| Stack | Detected | Configured version |"
+            echo "|---|---|---|"
+            echo "| Go | $IS_GO | $GO_VERSION |"
+            echo "| Python | $IS_PYTHON | $PYTHON_VERSION |"
+            echo "| Node.js | $IS_NODE | $NODE_VERSION |"
+            echo "| Java | $IS_JAVA | $JAVA_VERSION |"
+            echo "| Pre-commit | $HAS_PRECOMMIT | - |"
+            echo ""
+            echo "**Node package manager:** $NODE_PM"
+            echo ""
+            echo "**Repository:** $GITHUB_REPOSITORY"
+            echo ""
+            echo "**Ref:** $GITHUB_REF_NAME"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -------------------------------------------------------
+      # Pre-commit hooks
+      # -------------------------------------------------------
+      - name: Run pre-commit hooks 🏃
+        if: steps.detect.outputs.has_precommit == 'true'
+        uses: pre-commit/action@v3.0.1
+        env:
+          # Formatting is validated by spotless:check.
+          # Do not modify source files in CI.
+          SKIP: spotless-apply
+        with:
+          extra_args: --all-files
+
+      # -------------------------------------------------------
+      # No pre-commit configuration
+      # -------------------------------------------------------
+      - name: Skip info
+        if: steps.detect.outputs.has_precommit != 'true'
+        run: |
+          echo "Pre-commit configuration not found. Skipping hooks."

@@ -1,0 +1,1081 @@
+name: Release Flow Orchestrator ♻️
+
+on:
+  workflow_call:
+    outputs:
+      promo_ref:
+        description: "Ref (branch) promovida (ex.: release/2026-...)"
+        value: ${{ jobs.ctx.outputs.promo_ref }}
+      image_by_digest:
+        description: "Imagem imutável resolvida para promoção (registry/repo/app@sha256:...)"
+        value: ${{ jobs.resolve_digest.outputs.image_by_digest }}
+      digest:
+        description: "Digest sha256 resolvido para a imagem promovida"
+        value: ${{ jobs.resolve_digest.outputs.digest }}
+      used_tag:
+        description: "Tag (pr-.../sha-...) usada para resolver o digest"
+        value: ${{ jobs.resolve_digest.outputs.used_tag }}
+      pr_number:
+        description: "PR associada ao commit (best-effort) usada na resolução do digest"
+        value: ${{ jobs.resolve_digest.outputs.pr_number }}
+      release_please_pr_url:
+        description: "URL da PR criada/atualizada pelo release-please"
+        value: ${{ jobs.release_please_pr.outputs.pr_url }}
+      release_please_pr_number:
+        description: "Número da PR do release-please"
+        value: ${{ jobs.release_please_pr.outputs.pr_number }}
+      tag_name:
+        description: "Tag SemVer criada no GitHub pelo release-please publish"
+        value: ${{ jobs.release_please_publish.outputs.tag_name }}
+      image_ref:
+        description: "Imagem final retaggeada para a tag SemVer (registry/repo/app:vX.Y.Z)"
+        value: ${{ jobs.retag_release_image.outputs.image_ref }}
+      sync_pr_url:
+        description: "URL da PR de sync release -> main"
+        value: ${{ jobs.sync_release_to_main.outputs.pr_url }}
+      sync_pr_number:
+        description: "Número da PR de sync release -> main"
+        value: ${{ jobs.sync_release_to_main.outputs.pr_number }}
+    inputs:
+      runs_on:
+        type: string
+        required: false
+        default: '["self-hosted","dev"]'
+
+      main_branch:
+        type: string
+        required: false
+        default: "main"
+
+      release_prefix:
+        type: string
+        required: false
+        default: "release/"
+
+      # build
+      dockerfile:
+        type: string
+        required: false
+        default: "Dockerfile"
+      context:
+        type: string
+        required: false
+        default: "."
+      registry_repo:
+        type: string
+        required: false
+        default: ""
+      nexus_hosted:
+        type: string
+        required: false
+        default: ""
+      insecure_registry:
+        type: boolean
+        required: false
+        default: true
+
+
+      # deploy
+      enable_deploy_ti:
+        type: string
+        required: false
+        default: "true"
+      enable_deploy_trg:
+        type: string
+        required: false
+        default: "true"
+      enable_deploy_prd:
+        type: string
+        required: false
+        default: "true"
+      namespace_ti:
+        type: string
+        required: false
+        default: "ti"
+      namespace_trg:
+        type: string
+        required: false
+        default: "trg"
+      namespace_prd:
+        type: string
+        required: false
+        default: "prod"
+      chart:
+        type: string
+        required: false
+        default: "./helm"
+      release_name:
+        type: string
+        required: false
+        default: ""
+
+      # chart remoto/terceiros (opcional)
+      repo:
+        description: "Helm repo URL (opcional; para charts remotos/terceiros)"
+        type: string
+        required: false
+        default: ""
+      repo_alias:
+        description: "Alias do Helm repo (opcional)"
+        type: string
+        required: false
+        default: ""
+      repo_username:
+        description: "Usuário do Helm repo (opcional)"
+        type: string
+        required: false
+        default: ""
+      chart_version:
+        type: string
+        required: false
+        default: ""
+      values:
+        type: string
+        required: false
+        default: ""
+      value_files:
+        type: string
+        required: false
+        default: ""
+
+      value_files_ti:
+        type: string
+        required: false
+        default: ""
+      value_files_trg:
+        type: string
+        required: false
+        default: ""
+      value_files_prd:
+        type: string
+        required: false
+        default: ""
+
+      validate_image:
+        type: boolean
+        required: false
+        default: true
+      skip_tls_verify:
+        type: boolean
+        required: false
+        default: true
+      timeout_helm:
+        description: "Tempo limite do deploy Helm em minutos (--timeout)"
+        required: false
+        type: string
+        default: "5m"
+      atomic:
+        type: boolean
+        required: false
+        default: true
+
+      # release please
+      release_please_config:
+        type: string
+        required: false
+        default: "release-please-config.json"
+      release_please_manifest:
+        type: string
+        required: false
+        default: ".release-please-manifest.json"
+
+      trigger_event_name:
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  ctx:
+    name: Context 🔎
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+
+    permissions:
+      contents: read
+      pull-requests: read
+
+    outputs:
+      event_name: ${{ steps.ctx.outputs.event_name }}
+      head_branch: ${{ steps.ctx.outputs.head_branch }}
+      base_branch: ${{ steps.ctx.outputs.base_branch }}
+      head_kind: ${{ steps.ctx.outputs.head_kind }}
+
+      is_bot_branch: ${{ steps.ctx.outputs.is_bot_branch }}
+      bot_kind: ${{ steps.ctx.outputs.bot_kind }}
+
+      is_dev_flow: ${{ steps.ctx.outputs.is_dev_flow }}
+      is_release_flow: ${{ steps.ctx.outputs.is_release_flow }}
+      release_id: ${{ steps.ctx.outputs.release_id }}
+      release_name: ${{ steps.ctx.outputs.release_name }}
+      app_name: ${{ steps.ctx.outputs.app_name }}
+
+      pr_action: ${{ steps.ctx.outputs.pr_action }}
+      pr_merged: ${{ steps.ctx.outputs.pr_merged }}
+
+      should_run_release_promotion: ${{ steps.ctx.outputs.should_run_release_promotion }}
+      promo_ref: ${{ steps.ctx.outputs.promo_ref }}
+
+      is_release_push: ${{ steps.ctx.outputs.is_release_push }}
+      is_release_please_merge_push: ${{ steps.ctx.outputs.is_release_please_merge_push }}
+      should_run_release_please_pr: ${{ steps.ctx.outputs.should_run_release_please_pr }}
+      should_run_release_please_publish: ${{ steps.ctx.outputs.should_run_release_please_publish }}
+
+    steps:
+      - name: Determine Context 🔎
+        id: ctx
+        run: |
+          set -euo pipefail
+
+          sanitize_name() {
+            echo "$1" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//' \
+              | cut -c1-63
+          }
+
+          EVENT_NAME="${{ inputs.trigger_event_name }}"
+          if [[ -z "${EVENT_NAME}" ]]; then EVENT_NAME="${GITHUB_EVENT_NAME}"; fi
+
+          PR_ACTION=""
+          PR_MERGED="false"
+          HEAD_BRANCH=""
+          BASE_BRANCH=""
+
+          case "${EVENT_NAME}" in
+            pull_request|pull_request_target)
+              PR_ACTION="${{ github.event.action }}"
+              PR_MERGED="${{ github.event.pull_request.merged }}"
+              [[ "${PR_MERGED}" == "true" ]] || PR_MERGED="false"
+              HEAD_BRANCH="${GITHUB_HEAD_REF:-}"
+              BASE_BRANCH="${GITHUB_BASE_REF:-}"
+              ;;
+            create)
+              HEAD_BRANCH="${GITHUB_REF_NAME:-${{ github.event.ref }}}"
+              BASE_BRANCH=""
+              ;;
+            push)
+              HEAD_BRANCH="${GITHUB_REF_NAME:-}"
+              BASE_BRANCH=""
+              ;;
+            *)
+              HEAD_BRANCH="${GITHUB_REF_NAME:-}"
+              BASE_BRANCH=""
+              ;;
+          esac
+
+          RELEASE_PREFIX="${{ inputs.release_prefix }}"
+          MAIN_BRANCH="${{ inputs.main_branch }}"
+
+          IS_BOT="false"
+          BOT_KIND=""
+          if [[ "${HEAD_BRANCH}" == release-please--* ]]; then IS_BOT="true"; BOT_KIND="release-please"; fi
+          if [[ "${HEAD_BRANCH}" == dependabot/* ]]; then IS_BOT="true"; BOT_KIND="dependabot"; fi
+
+          HEAD_KIND="other"
+          if [[ "${IS_BOT}" == "true" ]]; then
+            HEAD_KIND="bot"
+          elif [[ "${HEAD_BRANCH}" == "feature/"* ]]; then
+            HEAD_KIND="feature"
+          elif [[ "${HEAD_BRANCH}" == "bugfix/"* ]]; then
+            HEAD_KIND="bugfix"
+          elif [[ "${HEAD_BRANCH}" == "hotfix/"* ]]; then
+            HEAD_KIND="hotfix"
+          elif [[ "${HEAD_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            HEAD_KIND="release"
+          elif [[ "${HEAD_BRANCH}" == "${MAIN_BRANCH}" ]]; then
+            HEAD_KIND="main"
+          fi
+
+          IS_DEV_FLOW="false"
+          if [[ "${EVENT_NAME}" == "pull_request" && "${PR_ACTION}" != "closed" ]]; then
+            if [[ "${HEAD_KIND}" == "feature" || "${HEAD_KIND}" == "bugfix" || "${HEAD_KIND}" == "hotfix" ]]; then
+              if [[ "${BASE_BRANCH}" == "${MAIN_BRANCH}" || "${BASE_BRANCH}" == "${RELEASE_PREFIX}"* || "${BASE_BRANCH}" == "feature/"* ]]; then
+                IS_DEV_FLOW="true"
+              fi
+            fi
+          fi
+
+          IS_RELEASE_FLOW="false"
+          if [[ "${HEAD_KIND}" == "release" ]]; then IS_RELEASE_FLOW="true"; fi
+
+          RELEASE_ID=""
+          if [[ "${HEAD_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            RELEASE_ID="${HEAD_BRANCH#${RELEASE_PREFIX}}"
+          elif [[ "${BASE_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            RELEASE_ID="${BASE_BRANCH#${RELEASE_PREFIX}}"
+          fi
+
+          APP_NAME="${{ github.event.repository.name }}"
+          RELEASE_NAME="$(sanitize_name "${APP_NAME}")"
+
+          SHOULD_RUN_RELEASE_PROMOTION="false"
+          PROMO_REF=""
+
+          # detect branch-creation push (release/** created from main tip)
+          PUSH_CREATED="${{ github.event.created }}"
+          [[ "${PUSH_CREATED}" == "true" ]] || PUSH_CREATED="false"
+          BEFORE_SHA="${{ github.event.before }}"
+
+          if [[ "${EVENT_NAME}" == "create" && "${HEAD_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            SHOULD_RUN_RELEASE_PROMOTION="true"
+            PROMO_REF="${HEAD_BRANCH}"
+          fi
+
+          # If caller removed `on.create {}`, creation of release/** arrives as `push` with created=true and before=0000...
+          if [[ "${EVENT_NAME}" == "push" && "${HEAD_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            if [[ "${PUSH_CREATED}" == "true" || "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
+              SHOULD_RUN_RELEASE_PROMOTION="true"
+              PROMO_REF="${HEAD_BRANCH}"
+            fi
+          fi
+
+          # PR merged -> release/**: somente bugfix/** e hotfix/** (release-please/dependabot não devem promover)
+          if [[ "${EVENT_NAME}" == "pull_request" && "${PR_ACTION}" == "closed" && "${PR_MERGED}" == "true" && "${BASE_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            if [[ "${IS_BOT}" != "true" ]]; then
+              if [[ "${HEAD_KIND}" == "bugfix" || "${HEAD_KIND}" == "hotfix" ]]; then
+                SHOULD_RUN_RELEASE_PROMOTION="true"
+                PROMO_REF="${BASE_BRANCH}"
+              fi
+            fi
+          fi
+
+          IS_RELEASE_PUSH="false"
+          if [[ "${EVENT_NAME}" == "push" && "${HEAD_BRANCH}" == "${RELEASE_PREFIX}"* ]]; then
+            IS_RELEASE_PUSH="true"
+          fi
+
+          IS_RELEASE_PLEASE_MERGE_PUSH="false"
+          if [[ "${EVENT_NAME}" == "push" && "${IS_RELEASE_PUSH}" == "true" ]]; then
+            GH_TOKEN="${{ github.token }}"
+            PULLS_JSON="$(curl -sS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${{ github.api_url }}/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls?per_page=10" || true)"
+
+            IS_RP="$(python3 -c "import json,sys; s=sys.stdin.read().strip(); d=json.loads(s) if s else []; print(\"true\" if any(((pr.get(\"head\") or {}).get(\"ref\",\"\")).startswith(\"release-please--\") for pr in d) else \"false\")" <<<"${PULLS_JSON}")"
+            [[ "${IS_RP}" == "true" ]] && IS_RELEASE_PLEASE_MERGE_PUSH="true"
+          fi
+
+          SHOULD_RUN_RELEASE_PLEASE_PR="false"
+          SHOULD_RUN_RELEASE_PLEASE_PUBLISH="false"
+          [[ "${SHOULD_RUN_RELEASE_PROMOTION}" == "true" ]] && SHOULD_RUN_RELEASE_PLEASE_PR="true"
+          [[ "${IS_RELEASE_PLEASE_MERGE_PUSH}" == "true" ]] && SHOULD_RUN_RELEASE_PLEASE_PUBLISH="true"
+
+          {
+            echo "event_name=${EVENT_NAME}"
+            echo "head_branch=${HEAD_BRANCH}"
+            echo "base_branch=${BASE_BRANCH}"
+            echo "head_kind=${HEAD_KIND}"
+            echo "is_bot_branch=${IS_BOT}"
+            echo "bot_kind=${BOT_KIND}"
+            echo "is_dev_flow=${IS_DEV_FLOW}"
+            echo "is_release_flow=${IS_RELEASE_FLOW}"
+            echo "pr_action=${PR_ACTION}"
+            echo "pr_merged=${PR_MERGED}"
+            echo "should_run_release_promotion=${SHOULD_RUN_RELEASE_PROMOTION}"
+            echo "promo_ref=${PROMO_REF}"
+            echo "is_release_push=${IS_RELEASE_PUSH}"
+            echo "is_release_please_merge_push=${IS_RELEASE_PLEASE_MERGE_PUSH}"
+            echo "should_run_release_please_pr=${SHOULD_RUN_RELEASE_PLEASE_PR}"
+            echo "should_run_release_please_publish=${SHOULD_RUN_RELEASE_PLEASE_PUBLISH}"
+            echo "release_id=${RELEASE_ID}"
+            echo "release_name=${RELEASE_NAME}"
+            echo "app_name=${APP_NAME}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build & Push ♻️
+    needs: [ctx]
+    if: >-
+      ${{
+        needs.ctx.outputs.event_name == 'pull_request' &&
+        needs.ctx.outputs.pr_action != 'closed' &&
+        needs.ctx.outputs.is_dev_flow == 'true' &&
+        needs.ctx.result == 'success'
+      }}
+    uses: V-tal/shared-workflows/.github/workflows/build-docker.yml@main
+    with:
+      runs_on: ${{ inputs.runs_on }}
+      dockerfile: ${{ inputs.dockerfile }}
+      context: ${{ inputs.context }}
+      registry_repo: ${{ inputs.registry_repo != '' && inputs.registry_repo || github.event.repository.name }}
+      nexus_hosted: ${{ inputs.nexus_hosted }}
+      insecure_registry: ${{ inputs.insecure_registry }}
+    secrets:
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+
+  resolve_digest:
+    name: Resolve Digest 🧾
+    needs: [ctx]
+    if: ${{ needs.ctx.outputs.should_run_release_promotion == 'true' || needs.ctx.outputs.should_run_release_please_publish == 'true' }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    outputs:
+      image_uri: ${{ steps.out.outputs.image_uri }}
+      digest: ${{ steps.out.outputs.digest }}
+      image_by_digest: ${{ steps.out.outputs.image_by_digest }}
+      used_tag: ${{ steps.out.outputs.used_tag }}
+      pr_number: ${{ steps.out.outputs.pr_number }}
+      pr_head_sha: ${{ steps.out.outputs.pr_head_sha }}
+    env:
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+      INSECURE: ${{ inputs.insecure_registry }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.ctx.outputs.promo_ref != '' && needs.ctx.outputs.promo_ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Resolve Registry Vars
+        id: vars
+        run: |
+          set -euo pipefail
+          # Aceita:
+          # - host: "registry.example.com"
+          # - host + path: "registry.example.com/docker-hosted/releaseflow"
+          # - com schema: "https://registry.example.com/docker-hosted"
+          REG_RAW="${{ inputs.nexus_hosted }}"
+          [[ -z "${REG_RAW}" ]] && REG_RAW="${{ vars.NEXUS_HOSTED }}"
+          : "${REG_RAW:?Defina inputs.nexus_hosted OU vars.NEXUS_HOSTED}"
+
+          # strip scheme
+          REG_RAW="${REG_RAW#http://}"
+          REG_RAW="${REG_RAW#https://}"
+
+          REG_HOST="${REG_RAW%%/*}"
+          REG_PATH="${REG_RAW#${REG_HOST}}"
+          [[ "${REG_PATH}" == "${REG_RAW}" ]] && REG_PATH=""
+          REG_PATH="${REG_PATH#/}"
+
+          APP="${GITHUB_REPOSITORY##*/}"
+          REPO_IN="${{ inputs.registry_repo }}"
+
+          # Se o host já veio com path (ex.: docker-hosted/releaseflow), usa isso como base.
+          # Se REPO_IN estiver setado, concatena evitando duplicação.
+          REPO_PATH=""
+          if [[ -z "${REPO_IN}" ]]; then
+            REPO_PATH="${REG_PATH}"
+            [[ -z "${REPO_PATH}" ]] && REPO_PATH="${APP}"
+          else
+            if [[ -n "${REG_PATH}" ]]; then
+              if [[ "${REG_PATH}" == "${REPO_IN}" || "${REG_PATH}" == */"${REPO_IN}" ]]; then
+                REPO_PATH="${REG_PATH}"
+              else
+                REPO_PATH="${REG_PATH}/${REPO_IN}"
+              fi
+            else
+              REPO_PATH="${REPO_IN}"
+            fi
+          fi
+
+          IMG_PATH="${REPO_PATH}/${APP}"
+          IMG_PATH="${IMG_PATH#/}"
+          IMAGE_URI="${REG_HOST}/${IMG_PATH}"
+
+          echo "registry_host=${REG_HOST}" >> "$GITHUB_OUTPUT"
+          echo "repo_path=${REPO_PATH}" >> "$GITHUB_OUTPUT"
+          echo "app=${APP}" >> "$GITHUB_OUTPUT"
+          echo "img_path=${IMG_PATH}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve Digest
+        id: out
+        env:
+          REGISTRY_HOST: ${{ steps.vars.outputs.registry_host }}
+          IMG_PATH:      ${{ steps.vars.outputs.img_path }}
+          IMAGE_URI:     ${{ steps.vars.outputs.image_uri }}
+        run: |
+          set -euo pipefail
+          ACCEPT='application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          CURL_K=""
+          [[ "${INSECURE}" == "true" ]] && CURL_K="-k"
+
+          fetch_digest_for_tag() {
+            tag="$1"
+            url="https://${REGISTRY_HOST}/v2/${IMG_PATH}/manifests/${tag}"
+            hdr="$(mktemp)"
+
+            code="$(curl -sS ${CURL_K} \
+              -u "${NEXUS_USER}:${NEXUS_PASS}" \
+              -H "Accept: ${ACCEPT}" \
+              -D "$hdr" -o /dev/null -w "%{http_code}" \
+              "$url" || true)"
+
+            if [[ "$code" == "200" ]]; then
+              dig="$(grep -i '^docker-content-digest:' "$hdr" | tail -n 1 | cut -d' ' -f2- | tr -d '\r')"
+              rm -f "$hdr"
+              [[ -n "${dig}" ]] && { echo "${dig}"; return 0; }
+            fi
+
+            rm -f "$hdr"
+            return 1
+          }
+
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          if [[ "${{ needs.ctx.outputs.should_run_release_please_publish }}" == "true" ]]; then
+            COMMIT_SHA="${{ github.event.before }}"
+          fi
+
+          PULLS_JSON="$(curl -sS \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/commits/${COMMIT_SHA}/pulls?per_page=1" || true)"
+
+          PR_NUMBER="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["number"] if d else "")' <<<"$PULLS_JSON")"
+          HEAD_SHA="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["head"]["sha"] if d else "")' <<<"$PULLS_JSON")"
+
+          # Se não houver PR (ex.: criação de release/**), cai para o commit atual
+          if [[ -z "${HEAD_SHA}" ]]; then
+            HEAD_SHA="${COMMIT_SHA}"
+          fi
+          SHA7="${HEAD_SHA:0:7}"
+
+          CANDIDATES=()
+          if [[ -n "${PR_NUMBER}" ]]; then
+            CANDIDATES+=( "pr-${PR_NUMBER}-${SHA7}-rc" )
+          fi
+          CANDIDATES+=(
+            "sha-${HEAD_SHA}"
+            "sha-${SHA7}"
+          )
+
+          DIGEST=""
+          USED_TAG=""
+
+          for t in "${CANDIDATES[@]}"; do
+            [[ -z "${t}" || "${t}" == "pr--"* ]] && continue
+            d="$(fetch_digest_for_tag "${t}" || true)"
+            if [[ -n "${d}" ]]; then
+              USED_TAG="${t}"
+              DIGEST="${d}"
+              break
+            fi
+          done
+
+          if [[ -z "${DIGEST}" ]]; then
+            echo "❌ Nao encontrei digest para nenhuma tag candidata."
+            echo "Candidatas testadas: ${CANDIDATES[*]}"
+            echo "Endpoint base: https://${REGISTRY}/v2/${IMG_PATH}/manifests/<tag>"
+            exit 1
+          fi
+
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "pr_head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "used_tag=${USED_TAG}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "image_by_digest=${IMAGE_URI}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Resolve digest"
+            echo "- image: \`${IMAGE_URI}\`"
+            echo "- used_tag: \`${USED_TAG}\`"
+            echo "- pr: \`${PR_NUMBER}\`"
+            echo "- head_sha: \`${HEAD_SHA}\`"
+            echo "- digest: \`${DIGEST}\`"
+            echo "- image_by_digest: \`${IMAGE_URI}@${DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy_ti:
+    name: Deploy TI 🧪
+    needs: [ctx, resolve_digest]
+    if: >-
+      ${{
+        inputs.enable_deploy_ti == 'true' &&
+        needs.ctx.outputs.should_run_release_promotion == 'true' &&
+        needs.resolve_digest.result == 'success' &&
+        needs.resolve_digest.outputs.image_by_digest != ''
+      }}
+    uses: V-tal/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main
+    with:
+      runs_on: ${{ inputs.runs_on }}
+      environment: Ti
+      release: ${{ inputs.release_name != '' && inputs.release_name || needs.ctx.outputs.release_name }}
+      namespace: ${{ inputs.namespace_ti }}
+      chart: ${{ inputs.chart }}
+      chart_version: ${{ inputs.chart_version }}
+      repo: ${{ inputs.repo }}
+      repo_alias: ${{ inputs.repo_alias }}
+      repo_username: ${{ inputs.repo_username }}
+      values: ${{ inputs.values }}
+      value_files: ${{ inputs.value_files_ti != '' && inputs.value_files_ti || inputs.value_files }}
+      image_ref: ${{ needs.resolve_digest.outputs.image_by_digest }}
+      validate_image: ${{ inputs.validate_image }}
+      skip_tls_verify: ${{ inputs.skip_tls_verify }}
+      timeout_helm: ${{ inputs.timeout_helm }}
+      atomic: ${{ inputs.atomic }}
+    secrets:
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+      OC_TOKEN: ${{ secrets.OC_TOKEN_TI }}
+      OC_SERVER: ${{ secrets.OC_SERVER_TI }}
+
+  deploy_trg:
+    name: Deploy TRG 🧫
+    needs: [ctx, resolve_digest, deploy_ti]
+    if: >-
+      ${{
+        always() &&
+        inputs.enable_deploy_trg == 'true' &&
+        needs.ctx.outputs.should_run_release_promotion == 'true' &&
+        needs.resolve_digest.result == 'success' &&
+        needs.resolve_digest.outputs.image_by_digest != '' &&
+        (
+          inputs.enable_deploy_ti != 'true' ||
+          needs.deploy_ti.result == 'success'
+        )
+      }}
+    uses: V-tal/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main
+    with:
+      runs_on: ${{ inputs.runs_on }}
+      environment: Trg
+      release: ${{ inputs.release_name != '' && inputs.release_name || needs.ctx.outputs.release_name }}
+      namespace: ${{ inputs.namespace_trg }}
+      chart: ${{ inputs.chart }}
+      chart_version: ${{ inputs.chart_version }}
+      repo: ${{ inputs.repo }}
+      repo_alias: ${{ inputs.repo_alias }}
+      repo_username: ${{ inputs.repo_username }}
+      values: ${{ inputs.values }}
+      value_files: ${{ inputs.value_files_trg != '' && inputs.value_files_trg || inputs.value_files }}
+      image_ref: ${{ needs.resolve_digest.outputs.image_by_digest }}
+      validate_image: ${{ inputs.validate_image }}
+      skip_tls_verify: ${{ inputs.skip_tls_verify }}
+      timeout_helm: ${{ inputs.timeout_helm }}
+      atomic: ${{ inputs.atomic }}
+    secrets:
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+      OC_TOKEN: ${{ secrets.OC_TOKEN_TRG }}
+      OC_SERVER: ${{ secrets.OC_SERVER_TRG }}
+
+  release_please_pr:
+    name: Release Pull Request 🔗
+    environment: Release
+    needs: [ctx, resolve_digest, deploy_ti, deploy_trg]
+    if: >-
+      ${{
+        always() &&
+        needs.ctx.outputs.should_run_release_please_pr == 'true' &&
+        needs.resolve_digest.result == 'success' &&
+        (
+          inputs.enable_deploy_ti != 'true' ||
+          needs.deploy_ti.result == 'success'
+        ) &&
+        (
+          inputs.enable_deploy_trg != 'true' ||
+          needs.deploy_trg.result == 'success'
+        )
+      }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    permissions:
+      contents: write
+      pull-requests: write
+
+    outputs:
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+
+    steps:
+      - name: Pick Token
+        id: tok
+        run: |
+          set -euo pipefail
+          T="${{ secrets.RELEASE_PLEASE_TOKEN }}"
+          if [[ -z "${T:-}" ]]; then T="${{ github.token }}"; fi
+          echo "token=${T}" >> "$GITHUB_OUTPUT"
+
+      - id: rp
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ steps.tok.outputs.token }}
+          config-file: ${{ inputs.release_please_config }}
+          manifest-file: ${{ inputs.release_please_manifest }}
+          target-branch: ${{ needs.ctx.outputs.promo_ref }}
+          skip-github-release: true
+
+      - name: Capture Release-Please PR 🔗
+        id: pr
+        shell: bash
+        env:
+          PRS: ${{ steps.rp.outputs.prs }}
+        run: |
+          set -euo pipefail
+
+          # PRS vem como JSON array: [{"number":52,...}, ...]
+          PR_NUMBERS="$(python3 - <<'PY'
+          import os, json
+          s = os.environ.get("PRS","") or ""
+          nums=[]
+          try:
+            prs=json.loads(s)
+            if isinstance(prs,list):
+              for pr in prs:
+                n = pr.get("number")
+                if n is not None:
+                  nums.append(str(n))
+          except Exception:
+            pass
+          print(",".join(nums))
+          PY
+          )"
+
+          FIRST_PR_NUMBER="${PR_NUMBERS%%,*}"
+          PR_URL=""
+          if [[ -n "${FIRST_PR_NUMBER}" ]]; then
+            PR_URL="https://github.com/${GITHUB_REPOSITORY}/pull/${FIRST_PR_NUMBER}"
+          fi
+
+          echo "pr_number=${FIRST_PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Release Please 🧾"
+            if [[ -n "${PR_NUMBERS}" ]]; then
+              echo "- PR(s):"
+              IFS=',' read -ra ARR <<< "${PR_NUMBERS}"
+              for n in "${ARR[@]}"; do
+                echo "  - [#${n}](https://github.com/${GITHUB_REPOSITORY}/pull/${n})"
+              done
+            else
+              echo "- PR: (nenhuma PR criada/atualizada nesta execução)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release_please_publish:
+    name: Create Tag On GitHub 🏷️
+    needs: [ctx, resolve_digest]
+    if: >-
+      ${{
+        needs.ctx.outputs.should_run_release_please_publish == 'true'
+      }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      releases_created: ${{ steps.rp.outputs.releases_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - name: Pick Token
+        id: tok
+        run: |
+          set -euo pipefail
+          T="${{ secrets.RELEASE_PLEASE_TOKEN }}"
+          if [[ -z "${T:-}" ]]; then T="${{ github.token }}"; fi
+          echo "token=${T}" >> "$GITHUB_OUTPUT"
+
+      - id: rp
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ steps.tok.outputs.token }}
+          config-file: ${{ inputs.release_please_config }}
+          manifest-file: ${{ inputs.release_please_manifest }}
+          target-branch: ${{ needs.ctx.outputs.head_branch }}
+          skip-github-pull-request: true
+
+  retag_release_image:
+    name: Retag Release Image 🏷️
+    needs: [ctx, resolve_digest, release_please_publish]
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    if: >-
+      ${{
+        needs.ctx.outputs.should_run_release_please_publish == 'true' &&
+        needs.release_please_publish.outputs.releases_created == 'true' &&
+        needs.release_please_publish.outputs.tag_name != '' &&
+        needs.resolve_digest.outputs.digest != ''
+      }}
+    env:
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+      INSECURE: ${{ inputs.insecure_registry }}
+      TAG: ${{ needs.release_please_publish.outputs.tag_name }}
+      DIGEST: ${{ needs.resolve_digest.outputs.digest }}
+    outputs:
+      image_ref: ${{ steps.retag.outputs.image_ref }}
+      tag_name: ${{ steps.retag.outputs.tag_name }}
+    steps:
+      - name: Install Skopeo 🧰
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="v1.21.0"
+          SKOPEO_BIN="${RUNNER_TEMP}/skopeo"
+          curl -fsSL -o "${SKOPEO_BIN}" \
+            "https://github.com/lework/skopeo-binary/releases/download/${VERSION}/skopeo-linux-amd64"
+          chmod +x "${SKOPEO_BIN}"
+
+      - name: Retag by digest
+        id: retag
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Aceita:
+          # - host: "registry.example.com"
+          # - host + path: "registry.example.com/docker-hosted/releaseflow"
+          # - com schema: "https://registry.example.com/docker-hosted"
+          REG_RAW="${{ inputs.nexus_hosted }}"
+          [[ -z "${REG_RAW}" ]] && REG_RAW="${{ vars.NEXUS_HOSTED }}"
+          : "${REG_RAW:?REGISTRY vazio (inputs.nexus_hosted ou vars.NEXUS_HOSTED)}"
+
+          REG_RAW="${REG_RAW#http://}"
+          REG_RAW="${REG_RAW#https://}"
+
+          REG_HOST="${REG_RAW%%/*}"
+          REG_PATH="${REG_RAW#${REG_HOST}}"
+          [[ "${REG_PATH}" == "${REG_RAW}" ]] && REG_PATH=""
+          REG_PATH="${REG_PATH#/}"
+
+          APP="${GITHUB_REPOSITORY##*/}"
+          REPO_IN="${{ inputs.registry_repo }}"
+
+          REPO_PATH=""
+          if [[ -z "${REPO_IN}" ]]; then
+            REPO_PATH="${REG_PATH}"
+            [[ -z "${REPO_PATH}" ]] && REPO_PATH="${APP}"
+          else
+            if [[ -n "${REG_PATH}" ]]; then
+              if [[ "${REG_PATH}" == "${REPO_IN}" || "${REG_PATH}" == */"${REPO_IN}" ]]; then
+                REPO_PATH="${REG_PATH}"
+              else
+                REPO_PATH="${REG_PATH}/${REPO_IN}"
+              fi
+            else
+              REPO_PATH="${REPO_IN}"
+            fi
+          fi
+
+          IMG_PATH="${REPO_PATH}/${APP}"
+          IMG_PATH="${IMG_PATH#/}"
+
+          SRC="docker://${REG_HOST}/${IMG_PATH}@${DIGEST}"
+          DST="docker://${REG_HOST}/${IMG_PATH}:${TAG}"
+
+          AUTHFILE="${RUNNER_TEMP}/auth.json"
+          mkdir -p "$(dirname "$AUTHFILE")"
+          cat > "$AUTHFILE" <<EOF
+          { "auths": { "${REG_HOST}": { "auth": "$(printf "%s" "${NEXUS_USER}:${NEXUS_PASS}" | base64 -w0)" } } }
+          EOF
+
+          INSEC=""
+          [[ "${INSECURE}" == "true" ]] && INSEC="--tls-verify=false"
+
+          "${RUNNER_TEMP}/skopeo" copy $INSEC --authfile "$AUTHFILE" "$SRC" "$DST"
+
+          echo "image_ref=${REG_HOST}/${IMG_PATH}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Retag"
+            echo "- src: \`${REG_HOST}/${IMG_PATH}@${DIGEST}\`"
+            echo "- dst: \`${REG_HOST}/${IMG_PATH}:${TAG}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy_prd:
+    name: Deploy PRD 🚀
+    needs: [ctx, retag_release_image]
+    if: >-
+      ${{
+        inputs.enable_deploy_prd == 'true' &&
+        needs.ctx.outputs.should_run_release_please_publish == 'true' &&
+        needs.retag_release_image.result == 'success' &&
+        needs.retag_release_image.outputs.image_ref != ''
+      }}
+    uses: V-tal/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main
+    with:
+      runs_on: ${{ inputs.runs_on }}
+      environment: Prd
+      release: ${{ inputs.release_name != '' && inputs.release_name || needs.ctx.outputs.release_name }}
+      namespace: ${{ inputs.namespace_prd }}
+      chart: ${{ inputs.chart }}
+      chart_version: ${{ inputs.chart_version }}
+      repo: ${{ inputs.repo }}
+      repo_alias: ${{ inputs.repo_alias }}
+      repo_username: ${{ inputs.repo_username }}
+      values: ${{ inputs.values }}
+      value_files: ${{ inputs.value_files_prd != '' && inputs.value_files_prd || inputs.value_files }}
+      image_ref: ${{ needs.retag_release_image.outputs.image_ref }}
+      validate_image: ${{ inputs.validate_image }}
+      skip_tls_verify: ${{ inputs.skip_tls_verify }}
+      timeout_helm: ${{ inputs.timeout_helm }}
+      atomic: ${{ inputs.atomic }}
+    secrets:
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+      OC_TOKEN: ${{ secrets.OC_TOKEN_PRD }}
+      OC_SERVER: ${{ secrets.OC_SERVER_PRD }}
+
+  sync_release_to_main:
+    name: Sync Release To Main 🔁
+    needs: [ctx, release_please_publish, retag_release_image, deploy_prd]
+    if: >-
+      ${{
+        always() &&
+        needs.release_please_publish.result == 'success' &&
+        needs.retag_release_image.result == 'success' &&
+        (
+          inputs.enable_deploy_prd != 'true' ||
+          needs.deploy_prd.result == 'success'
+        ) &&
+        needs.release_please_publish.outputs.releases_created == 'true' &&
+        needs.release_please_publish.outputs.tag_name != ''
+      }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+
+    permissions:
+      pull-requests: write
+      contents: write
+
+    outputs:
+      pr_url: ${{ steps.sync_pr.outputs.pr_url }}
+      pr_number: ${{ steps.sync_pr.outputs.pr_number }}
+
+    steps:
+      - name: Open PR Release To Main
+        id: sync_pr
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const head  = process.env.HEAD_BRANCH;
+            const base  = process.env.BASE_BRANCH;
+            const tag   = process.env.TAG_NAME;
+
+            const existing = await github.rest.pulls.list({
+              owner, repo,
+              state: 'open',
+              head: `${owner}:${head}`,
+              base
+            });
+
+            if (existing.data.length > 0) {
+              const pr = existing.data[0];
+
+              core.setOutput('pr_url', pr.html_url);
+              core.setOutput('pr_number', String(pr.number));
+
+              core.info(`Já existe PR aberta: ${pr.html_url}`);
+              return;
+            }
+
+            try {
+              const title = `chore(sync): ${head} To ${base} (${tag})`;
+              const body  = `Sync automático após release publish.\n\nTag: \`${tag}\``;
+
+              const pr = await github.rest.pulls.create({
+                owner, repo, head, base, title, body
+              });
+
+              core.setOutput('pr_url', pr.data.html_url);
+              core.setOutput('pr_number', String(pr.data.number));
+
+              core.notice(`PR criada: ${pr.data.html_url}`);
+            } catch (e) {
+              // 422 geralmente significa "sem diff" (nada pra sincronizar)
+              core.warning(e.message);
+
+              core.setOutput('pr_url', '');
+              core.setOutput('pr_number', '');
+            }
+        env:
+          HEAD_BRANCH: ${{ needs.ctx.outputs.head_branch }}
+          BASE_BRANCH: ${{ inputs.main_branch }}
+          TAG_NAME: ${{ needs.release_please_publish.outputs.tag_name }}
+
+
+  summary:
+    name: Summary 📜
+    needs:
+      [
+        ctx,
+        build,
+        resolve_digest,
+        deploy_ti,
+        deploy_trg,
+        deploy_prd,
+        release_please_pr,
+        release_please_publish,
+        retag_release_image,
+        sync_release_to_main
+      ]
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    if: ${{ always() }}
+    steps:
+      - name: Final summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RP_PR_URL="${{ needs.release_please_pr.outputs.pr_url }}"
+          RP_PR_NUM="${{ needs.release_please_pr.outputs.pr_number }}"
+
+          SYNC_PR_URL="${{ needs.sync_release_to_main.outputs.pr_url }}"
+          SYNC_PR_NUM="${{ needs.sync_release_to_main.outputs.pr_number }}"
+
+          {
+            echo "## Release Flow — Resumo"
+            echo
+            echo "- event: \`${{ needs.ctx.outputs.event_name }}\`"
+            echo "- head_branch: \`${{ needs.ctx.outputs.head_branch }}\`"
+            echo "- promo_ref: \`${{ needs.ctx.outputs.promo_ref || 'Not Promo' }}\`"
+            echo "- should_run_release_promotion: \`${{ needs.ctx.outputs.should_run_release_promotion }}\`"
+            echo "- should_run_release_please_pr: \`${{ needs.ctx.outputs.should_run_release_please_pr }}\`"
+            echo "- should_run_release_please_publish: \`${{ needs.ctx.outputs.should_run_release_please_publish }}\`"
+            echo
+            echo "### Jobs"
+            echo "- release_please_pr: \`${{ needs.release_please_pr.result || 'skipped' }}\`"
+            echo "- release_please_publish: \`${{ needs.release_please_publish.result || 'skipped' }}\`"
+            echo "- retag_release_image: \`${{ needs.retag_release_image.result || 'skipped' }}\`"
+            echo "- sync_release_to_main: \`${{ needs.sync_release_to_main.result || 'skipped' }}\`"
+            echo
+            echo "### Pull Requests"
+
+            # Release Please PR
+            if [[ -n "${RP_PR_URL}" && "${RP_PR_URL}" == http* ]]; then
+              if [[ -n "${RP_PR_NUM}" ]]; then
+                echo "- Release Please PR: [#${RP_PR_NUM}](${RP_PR_URL})"
+              else
+                echo "- Release Please PR: ${RP_PR_URL}"
+              fi
+            else
+              echo "- Release Please PR: <none>"
+            fi
+
+            # Sync PR
+            if [[ -n "${SYNC_PR_URL}" && "${SYNC_PR_URL}" == http* ]]; then
+              if [[ -n "${SYNC_PR_NUM}" ]]; then
+                echo "- Sync PR (release → main): [#${SYNC_PR_NUM}](${SYNC_PR_URL})"
+              else
+                echo "- Sync PR (release → main): ${SYNC_PR_URL}"
+              fi
+            else
+              echo "- Sync PR (release → main): <none>"
+            fi
+
+            echo
+            echo "### Environments"
+            echo "- deploy_ti: \`${{ needs.deploy_ti.result || 'skipped' }}\`"
+            echo "- deploy_trg: \`${{ needs.deploy_trg.result || 'skipped' }}\`"
+            echo "- deploy_prd: \`${{ needs.deploy_prd.result || 'skipped' }}\`"
+            echo
+            echo "### Results"
+            echo "- build: \`${{ needs.build.result || 'skipped' }}\`"
+            echo "- resolve_digest: \`${{ needs.resolve_digest.result || 'skipped' }}\`"
+            echo "- image_ref_promotion: \`${{ needs.resolve_digest.outputs.image_by_digest || 'n/a' }}\`"
+            echo "- digest: \`${{ needs.resolve_digest.outputs.digest || 'n/a' }}\`"
+            echo "- used_tag: \`${{ needs.resolve_digest.outputs.used_tag || 'n/a' }}\`"
+            echo "- pr_number: \`${{ needs.resolve_digest.outputs.pr_number || 'n/a' }}\`"
+            echo "- image_ref_prd: \`${{ needs.retag_release_image.outputs.image_ref || 'n/a' }}\`"
+            echo "- tag_name: \`${{ needs.release_please_publish.outputs.tag_name || 'n/a' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

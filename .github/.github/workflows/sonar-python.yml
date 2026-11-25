@@ -1,0 +1,727 @@
+name: Sonar Scan Python 🐍
+
+on:
+  workflow_call:
+    outputs:
+      sonar_dashboard_url:
+        value: ${{ jobs.sonar.outputs.sonar_dashboard_url }}
+      quality_gate_status:
+        value: ${{ jobs.sonar.outputs.quality_gate_status }}
+      sonar_coverage:
+        value: ${{ jobs.sonar.outputs.sonar_coverage }}
+      sonar_new_coverage:
+        value: ${{ jobs.sonar.outputs.sonar_new_coverage }}
+      sonar_required_coverage:
+        value: ${{ jobs.sonar.outputs.sonar_required_coverage }}
+      sonar_required_new_coverage:
+        value: ${{ jobs.sonar.outputs.sonar_required_new_coverage }}
+
+    inputs:
+      runs_on:
+        description: Runner labels (ex. ["self-hosted","dev"])
+        type: string
+        required: false
+        default: '["self-hosted","dev"]'
+
+      context:
+        description: Diretório do projeto Python (default .)
+        type: string
+        required: false
+        default: "."
+
+      # Python
+      # Em self-hosted RHEL/OpenShift, o padrão é NÃO usar actions/setup-python.
+      # Use Python instalado na imagem do runner: python3, python3.11, python3.12 etc.
+      python-version:
+        description: "Versão desejada somente quando use_setup_python=true, ou para procurar binário local pythonX.Y. Ex: 3.11"
+        type: string
+        required: false
+        default: "3.14"
+
+      python_bin:
+        description: "Binário Python local no runner. Ex: python3, python3.11 ou /usr/bin/python3."
+        type: string
+        required: false
+        default: ""
+
+      use_setup_python:
+        description: "Use true somente em runner compatível com actions/setup-python. Em RHEL self-hosted, mantenha false."
+        type: boolean
+        required: false
+        default: false
+
+      # Java usado pelo SonarScanner. Em self-hosted, prefira Java já instalado na imagem.
+      use_setup_java:
+        description: "Use true somente se quiser instalar Java via actions/setup-java. Em RHEL self-hosted, prefira false."
+        type: boolean
+        required: false
+        default: true
+
+      java-version:
+        type: string
+        required: false
+        default: "17"
+
+      java-distribution:
+        type: string
+        required: false
+        default: "temurin"
+
+      unit_tests_enabled:
+        description: "Se false, não roda testes/coverage e o Sonar roda sem coverage."
+        type: boolean
+        required: false
+        default: true
+
+      coverage_required:
+        description: "Se true e unit_tests_enabled=true, falha se não encontrar o coverage.xml."
+        type: boolean
+        required: false
+        default: false
+
+      # ---- Sonar ----
+      sonar_enabled:
+        type: boolean
+        required: false
+        default: true
+
+      sonar_host_url:
+        description: "URL do SonarQube (ex: https://sonar.seudominio)"
+        type: string
+        required: false
+        default: "${{ vars.SONAR_HOST_URL }}"
+
+      sonar_project_key:
+        type: string
+        required: false
+        default: ""
+
+      sonar_project_name:
+        type: string
+        required: false
+        default: ""
+
+      sonar_sources:
+        type: string
+        required: false
+        default: "."
+
+      sonar_tests:
+        type: string
+        required: false
+        default: "."
+
+      sonar_test_inclusions:
+        type: string
+        required: false
+        default: ""
+
+      sonar_exclusions:
+        type: string
+        required: false
+        default: ""
+
+      sonar_coverage:
+        description: "Arquivo coverage XML (pytest-cov) relativo ao context."
+        type: string
+        required: false
+        default: "coverage.xml"
+
+      sonar_project_version:
+        description: "Se vazio, calcula SHA7 / pr-<num>-<sha7>-rc"
+        type: string
+        required: false
+        default: ""
+
+      sonar_quality_gate_timeout_sec:
+        type: number
+        required: false
+        default: 300
+
+      sonar_extra_args:
+        description: "Args extras em linha única (ex: -Dsonar.python.version=3.12)"
+        type: string
+        required: false
+        default: ""
+
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      SONAR_ROOT_CERT:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: python-sonar-${{ github.repository }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sonar:
+    name: Sonar Scan 🔍
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    timeout-minutes: 45
+
+    outputs:
+      quality_gate_status: ${{ steps.quality-gate.outputs.quality-gate-status }}
+      sonar_dashboard_url: ${{ steps.dashboard.outputs.sonar_dashboard_url }}
+      sonar_coverage: ${{ steps.dashboard.outputs.sonar_coverage }}
+      sonar_new_coverage: ${{ steps.dashboard.outputs.sonar_new_coverage }}
+      sonar_required_coverage: ${{ steps.dashboard.outputs.sonar_required_coverage }}
+      sonar_required_new_coverage: ${{ steps.dashboard.outputs.sonar_required_new_coverage }}
+
+    env:
+      SONAR_HOST_URL: ${{ inputs.sonar_host_url }}
+
+    steps:
+      - name: Checkout 📥
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate Context 📁
+        working-directory: ${{ inputs.context }}
+        run: |
+          set -euo pipefail
+          test -d .
+
+      - name: Validate Sonar Config 🧾
+        if: ${{ inputs.sonar_enabled }}
+        run: |
+          set -euo pipefail
+          test -n "${{ inputs.sonar_host_url }}" || { echo "::error::inputs.sonar_host_url é obrigatório quando sonar_enabled=true"; exit 1; }
+          test -n "${{ inputs.sonar_project_key }}" || { echo "::error::inputs.sonar_project_key é obrigatório quando sonar_enabled=true"; exit 1; }
+          test -n "${{ secrets.SONAR_TOKEN }}" || { echo "::error::secrets.SONAR_TOKEN é obrigatório quando sonar_enabled=true"; exit 1; }
+
+      - name: Detect Python Tool 🔎
+        id: py
+        working-directory: ${{ inputs.context }}
+        run: |
+          set -euo pipefail
+          if [[ -f uv.lock ]] || ( [[ -f pyproject.toml ]] && grep -q "^\[tool\.uv\]" pyproject.toml ); then
+            echo "tool=uv" >> "$GITHUB_OUTPUT"
+          elif [[ -f poetry.lock ]] || ( [[ -f pyproject.toml ]] && grep -q "^\[tool\.poetry\]" pyproject.toml ); then
+            echo "tool=poetry" >> "$GITHUB_OUTPUT"
+          elif [[ -f Pipfile ]]; then
+            echo "tool=pipenv" >> "$GITHUB_OUTPUT"
+          else
+            echo "tool=pip" >> "$GITHUB_OUTPUT"
+          fi
+
+
+      # Opcional. Desabilitado por padrão para evitar erro em RHEL self-hosted:
+      # "The version 'X' with architecture 'x64' was not found for RedHatEnterprise..."
+      - name: Set Up Python 🐍
+        if: ${{ inputs.unit_tests_enabled && inputs.use_setup_python }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Resolve Python Bin 🐍
+        id: pybin
+        if: ${{ inputs.unit_tests_enabled }}
+        env:
+          PYTHON_BIN_INPUT: ${{ inputs.python_bin }}
+          PYTHON_VERSION_INPUT: ${{ inputs.python-version }}
+          USE_SETUP_PYTHON: ${{ inputs.use_setup_python }}
+        run: |
+          set -euo pipefail
+
+          candidates=()
+
+          if [[ -n "${PYTHON_BIN_INPUT}" ]]; then
+            candidates+=("${PYTHON_BIN_INPUT}")
+          fi
+
+          # Quando actions/setup-python é usado, normalmente ele expõe o binário como python.
+          if [[ "${USE_SETUP_PYTHON}" == "true" ]]; then
+            candidates+=("python")
+          fi
+
+          if [[ -n "${PYTHON_VERSION_INPUT}" ]]; then
+            candidates+=("python${PYTHON_VERSION_INPUT}")
+          fi
+
+          candidates+=(python3.13 python3.12 python3.11 python3.10 python3.9 python3 python)
+
+          selected=""
+          for c in "${candidates[@]}"; do
+            if command -v "$c" >/dev/null 2>&1; then
+              selected="$(command -v "$c")"
+              break
+            fi
+          done
+
+          if [[ -z "${selected}" ]]; then
+            echo "::error::Python não encontrado no runner."
+            echo "Instale Python na imagem/base do runner ou informe o input python_bin."
+            echo "Exemplo RHEL 8: dnf install -y python3 python3-pip"
+            exit 1
+          fi
+
+          SHIM_DIR="${RUNNER_TEMP:-/tmp}/python-shim"
+          mkdir -p "${SHIM_DIR}"
+          ln -sf "${selected}" "${SHIM_DIR}/python"
+          ln -sf "${selected}" "${SHIM_DIR}/python3"
+
+          echo "${SHIM_DIR}" >> "$GITHUB_PATH"
+          echo "bin=${selected}" >> "$GITHUB_OUTPUT"
+          echo "PYTHON_BIN=${selected}" >> "$GITHUB_ENV"
+
+          "${selected}" --version
+          "${selected}" -m pip --version || true
+
+      - name: Install Deps (Uv) ⚡
+        if: steps.py.outputs.tool == 'uv'
+        uses: astral-sh/setup-uv@v7
+
+      - name: Sync Env (Uv) ⚡
+        if: steps.py.outputs.tool == 'uv'
+        working-directory: ${{ inputs.context }}
+        run: uv sync
+
+      - name: Install Deps (Poetry) 🎭
+        if: steps.py.outputs.tool == 'poetry'
+        working-directory: ${{ inputs.context }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install poetry
+          poetry config virtualenvs.create false
+          poetry install --no-interaction --no-ansi
+
+      - name: Install Deps (Pipenv) 📦
+        if: steps.py.outputs.tool == 'pipenv'
+        working-directory: ${{ inputs.context }}
+        run: |
+          python -m pip install --upgrade pip pipenv
+          pipenv install --dev --deploy
+
+      - name: Install Deps (Pip) 📦
+        if: ${{ inputs.unit_tests_enabled && steps.pytool.outputs.tool == 'pip' }}
+        working-directory: ${{ inputs.context }}
+        run: |
+          set -euo pipefail
+          "${PYTHON_BIN}" -m ensurepip --upgrade >/dev/null 2>&1 || true
+          "${PYTHON_BIN}" -m pip install --upgrade pip
+
+          if [[ -f requirements.txt ]]; then
+            "${PYTHON_BIN}" -m pip install -r requirements.txt
+          elif [[ -f pyproject.toml ]]; then
+            "${PYTHON_BIN}" -m pip install .
+          else
+            echo "::warning::Nenhum requirements.txt/pyproject.toml encontrado. Pulando install."
+          fi
+
+      - name: Tests & Coverage 🧪
+        if: ${{ inputs.unit_tests_enabled }}
+        working-directory: ${{ inputs.context }}
+        env:
+          TOOL: ${{ steps.py.outputs.tool }}
+          COV: ${{ inputs.sonar_coverage }}
+        run: |
+          set -euo pipefail
+
+          # prefixo por ferramenta
+          prefix=()
+          case "${TOOL}" in
+            uv) prefix=(uv run) ;;
+            poetry) prefix=(poetry run) ;;
+            pipenv) prefix=(pipenv run) ;;
+            pip) prefix=() ;;
+          esac
+
+          runp() {
+            if (( ${#prefix[@]} )); then
+              "${prefix[@]}" "$@"
+            else
+              "$@"
+            fi
+          }
+
+          # Preferência: pytest + pytest-cov -> coverage.xml
+          if runp python -m pytest --version >/dev/null 2>&1; then
+            tmp="$(mktemp)"
+            set +e
+            runp python -m pytest -q --cov=. --cov-report=xml:"${COV}" 2>&1 | tee "${tmp}"
+            rc=${PIPESTATUS[0]}
+            set -e
+
+            if [[ $rc -ne 0 ]]; then
+              if grep -qiE "unrecognized arguments:.*--cov|error: unrecognized arguments:.*--cov" "${tmp}"; then
+                echo "::warning::pytest-cov não disponível. Tentando fallback com coverage.py."
+                if runp python -c "import coverage" >/dev/null 2>&1; then
+                  runp python -m coverage run -m pytest -q
+                  runp python -m coverage xml -o "${COV}"
+                else
+                  echo "::warning::coverage.py não está instalado; rodando pytest sem coverage."
+                  exit $rc
+                fi
+              else
+                echo "::error::pytest falhou."
+                exit $rc
+              fi
+            fi
+          else
+            echo "::warning::pytest não encontrado. Tentando unittest (best-effort com coverage)."
+            if runp python -c "import coverage" >/dev/null 2>&1; then
+              runp python -m coverage run -m unittest discover -v || true
+              runp python -m coverage xml -o "${COV}" || true
+            fi
+            runp python -m unittest discover -v
+          fi
+
+      - name: Verify Coverage File ✅
+        id: cov
+        working-directory: ${{ inputs.context }}
+        env:
+          COV: ${{ inputs.sonar_coverage }}
+          UT: ${{ inputs.unit_tests_enabled }}
+          REQUIRED: ${{ inputs.coverage_required }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${UT}" != "true" ]]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -f "${COV}" && -s "${COV}" ]]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "path=${COV}" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "::warning::Coverage file not found or empty: ${COV}"
+            if [[ "${REQUIRED}" == "true" ]]; then
+              echo "::error::Coverage is required but file is missing/empty: ${COV}"
+              exit 1
+            fi
+          fi
+
+      # SonarScanner (scan action) roda com Java por baixo
+      - name: Set Up Java ⚒️
+        if: ${{ inputs.sonar_enabled && inputs.use_setup_java }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ inputs.java-distribution }}
+          java-version: ${{ inputs.java-version }}
+
+      - name: Resolve Java ☕
+        id: java
+        if: ${{ inputs.sonar_enabled }}
+        run: |
+          set -euo pipefail
+
+          if ! command -v java >/dev/null 2>&1; then
+            echo "::error::Java não encontrado no runner. Instale Java 17 na imagem/base ou use use_setup_java=true."
+            echo "Exemplo RHEL 8: dnf install -y java-17-openjdk-devel"
+            exit 1
+          fi
+
+          JAVA_BIN="$(command -v java)"
+          JAVA_REAL="$(readlink -f "${JAVA_BIN}")"
+          JAVA_HOME_CANDIDATE="$(dirname "$(dirname "${JAVA_REAL}")")"
+
+          if [[ -z "${JAVA_HOME:-}" || ! -f "${JAVA_HOME}/lib/security/cacerts" ]]; then
+            export JAVA_HOME="${JAVA_HOME_CANDIDATE}"
+            echo "JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
+          fi
+
+          CACERTS="${JAVA_HOME}/lib/security/cacerts"
+          if [[ ! -f "${CACERTS}" && -f "${JAVA_HOME}/jre/lib/security/cacerts" ]]; then
+            CACERTS="${JAVA_HOME}/jre/lib/security/cacerts"
+          fi
+
+          if [[ ! -f "${CACERTS}" ]]; then
+            echo "::error::cacerts não encontrado em JAVA_HOME=${JAVA_HOME}."
+            exit 1
+          fi
+
+          echo "cacerts=${CACERTS}" >> "$GITHUB_OUTPUT"
+          java -version
+
+      - name: Trust SonarQube Certificate 🔐
+        if: ${{ inputs.sonar_enabled }}
+        env:
+          SONAR_ROOT_CERT: ${{ secrets.SONAR_ROOT_CERT }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SONAR_HOST_URL}" ]]; then
+            echo "::error::inputs.sonar_host_url está vazio."
+            exit 1
+          fi
+
+          HOST="$(python3 -c 'import os,urllib.parse; print(urllib.parse.urlparse(os.environ["SONAR_HOST_URL"]).hostname)')"
+          TRUSTSTORE=/tmp/my_truststore
+          CACERT_PEM=/tmp/sonar-ca.pem
+
+          cp -p "$JAVA_HOME/lib/security/cacerts" "$TRUSTSTORE"
+
+          if [[ -n "${SONAR_ROOT_CERT:-}" ]]; then
+            echo "✔ Usando SONAR_ROOT_CERT."
+            printf '%s\n' "$SONAR_ROOT_CERT" > "$CACERT_PEM"
+            keytool -delete -alias sonarqube-ca -keystore "$TRUSTSTORE" -storepass changeit >/dev/null 2>&1 || true
+            keytool -importcert -noprompt -trustcacerts \
+              -alias sonarqube-ca \
+              -file "$CACERT_PEM" \
+              -keystore "$TRUSTSTORE" \
+              -storepass changeit
+          else
+            echo "⚠ SONAR_ROOT_CERT não informado; fallback openssl."
+            rm -f /tmp/sonar-*.crt "$CACERT_PEM" || true
+            openssl s_client -showcerts -servername "$HOST" -connect "$HOST:443" </dev/null 2>/dev/null \
+              | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' > "$CACERT_PEM"
+
+            awk '
+              /BEGIN CERTIFICATE/ {i++; f=sprintf("/tmp/sonar-%02d.crt", i)}
+              {if (i>0) print > f}
+              /END CERTIFICATE/ {close(f)}
+            ' "$CACERT_PEM"
+
+            i=1
+            while true; do
+              f=$(printf "/tmp/sonar-%02d.crt" "$i")
+              [[ -f "$f" ]] || break
+              alias=$(printf "sonarqube-%s-%02d" "$HOST" "$i")
+              keytool -delete -alias "$alias" -keystore "$TRUSTSTORE" -storepass changeit >/dev/null 2>&1 || true
+              keytool -importcert -noprompt -trustcacerts \
+                -alias "$alias" \
+                -file "$f" \
+                -keystore "$TRUSTSTORE" \
+                -storepass changeit
+              i=$((i+1))
+            done
+          fi
+
+          # ajuda o Python/pip/requests também, quando necessário
+          echo "SSL_CERT_FILE=$CACERT_PEM" >> "$GITHUB_ENV"
+          echo "REQUESTS_CA_BUNDLE=$CACERT_PEM" >> "$GITHUB_ENV"
+
+      - name: Build Sonar args 🧩
+        id: sonarargs
+        if: ${{ inputs.sonar_enabled }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${{ inputs.sonar_project_key }}" ]]; then
+            echo "::error::inputs.sonar_project_key está vazio."
+            exit 1
+          fi
+
+          if [[ -z "${{ secrets.SONAR_TOKEN }}" ]]; then
+            echo "::error::secrets.SONAR_TOKEN não informado."
+            exit 1
+          fi
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          VERSION="${{ inputs.sonar_project_version }}"
+          if [[ -z "$VERSION" ]]; then
+            if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+              VERSION="pr-${{ github.event.pull_request.number }}-${SHORT_SHA}-rc"
+            else
+              VERSION="$SHORT_SHA"
+            fi
+          fi
+
+          PROJECT_NAME="${{ inputs.sonar_project_name }}"
+          if [[ -z "$PROJECT_NAME" ]]; then
+            PROJECT_NAME="${GITHUB_REPOSITORY##*/}"
+          fi
+
+          HAVE_COV="false"
+          if [[ "${{ inputs.unit_tests_enabled }}" == "true" && "${{ steps.cov.outputs.found }}" == "true" ]]; then
+            HAVE_COV="true"
+          fi
+
+          {
+            echo "-Dsonar.sourceEncoding=UTF-8"
+            echo "-Dsonar.projectVersion=$VERSION"
+            echo "-Dsonar.projectKey=${{ inputs.sonar_project_key }}"
+            echo "-Dsonar.projectName=$PROJECT_NAME"
+            echo "-Dsonar.sources=${{ inputs.sonar_sources }}"
+            echo "-Dsonar.verbose=true"
+
+            [[ -n "${{ inputs.sonar_tests }}" ]] && echo "-Dsonar.tests=${{ inputs.sonar_tests }}"
+            [[ -n "${{ inputs.sonar_test_inclusions }}" ]] && echo "-Dsonar.test.inclusions=${{ inputs.sonar_test_inclusions }}"
+            [[ -n "${{ inputs.sonar_exclusions }}" ]] && echo "-Dsonar.exclusions=${{ inputs.sonar_exclusions }}"
+
+            if [[ "$HAVE_COV" == "true" ]]; then
+              echo "-Dsonar.python.coverage.reportPaths=${{ steps.cov.outputs.path }}"
+            fi
+
+            if [[ "${GITHUB_EVENT_NAME}" == "pull_request" || "${GITHUB_EVENT_NAME}" == "pull_request_target" ]]; then
+              echo "-Dsonar.pullrequest.key=${{ github.event.pull_request.number }}"
+              echo "-Dsonar.pullrequest.branch=${{ github.head_ref }}"
+              echo "-Dsonar.pullrequest.base=${{ github.base_ref }}"
+            else
+              echo "-Dsonar.branch.name=${{ github.ref_name }}"
+            fi
+
+            # args extras livres (e NÃO como input da action)
+            [[ -n "${{ inputs.sonar_extra_args }}" ]] && echo "${{ inputs.sonar_extra_args }}"
+          } > /tmp/sonar_args.txt
+
+          {
+            echo "args<<EOF"
+            cat /tmp/sonar_args.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sonar Scan 🔍
+        if: ${{ inputs.sonar_enabled }}
+        uses: SonarSource/sonarqube-scan-action@v8
+        with:
+          projectBaseDir: ${{ inputs.context }}
+          args: ${{ steps.sonarargs.outputs.args }}
+        env:
+          SONAR_SCANNER_OPTS: "-Djavax.net.ssl.trustStore=/tmp/my_truststore -Djavax.net.ssl.trustStorePassword=changeit"
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+
+      - name: Quality Gate 🧱
+        id: quality-gate
+        if: ${{ inputs.sonar_enabled }}
+        uses: SonarSource/sonarqube-quality-gate-action@v1.2.0
+        with:
+          pollingTimeoutSec: ${{ inputs.sonar_quality_gate_timeout_sec }}
+          scanMetadataReportFile: ${{ inputs.context }}/.scannerwork/report-task.txt
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+
+      - name: Compute Dashboard URL + Coverage 🔗
+        id: dashboard
+        if: ${{ inputs.sonar_enabled }}
+        env:
+          SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ inputs.sonar_host_url }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import json
+          import base64
+          import urllib.parse
+          import urllib.request
+          import urllib.error
+
+          sonar_host = os.environ["SONAR_HOST_URL"].rstrip("/")
+          project_key = os.environ["SONAR_PROJECT_KEY"]
+          token = os.environ["SONAR_TOKEN"]
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          ref_name = os.environ.get("GITHUB_REF_NAME", "")
+          pr_number = os.environ.get("GITHUB_PR_NUMBER", "")
+
+          def sonar_get(path: str, params: dict, fallback_keys=None):
+              fallback_keys = set(fallback_keys or [])
+              auth = base64.b64encode(f"{token}:".encode()).decode()
+
+              def do_request(p):
+                  url = f"{sonar_host}{path}?{urllib.parse.urlencode(p)}"
+                  req = urllib.request.Request(url, headers={
+                      "Authorization": f"Basic {auth}"
+                  })
+                  with urllib.request.urlopen(req) as resp:
+                      return json.loads(resp.read().decode())
+
+              try:
+                  return do_request(params)
+              except urllib.error.HTTPError:
+                  if fallback_keys:
+                      reduced = {k: v for k, v in params.items() if k not in fallback_keys}
+                      return do_request(reduced)
+                  raise
+
+          encoded_key = urllib.parse.quote(project_key, safe="")
+          dashboard_url = f"{sonar_host}/dashboard?id={encoded_key}"
+
+          measures_params = {
+              "component": project_key,
+              "metricKeys": "coverage,new_coverage",
+          }
+          gate_params = {
+              "projectKey": project_key,
+          }
+
+          if event_name in ("pull_request", "pull_request_target") and pr_number:
+              measures_params["pullRequest"] = pr_number
+              gate_params["pullRequest"] = pr_number
+              fallback_keys = {"pullRequest"}
+          elif ref_name and ref_name not in ("main", "master"):
+              measures_params["branch"] = ref_name
+              gate_params["branch"] = ref_name
+              fallback_keys = {"branch"}
+          else:
+              fallback_keys = set()
+
+          measures = sonar_get(
+              "/api/measures/component",
+              measures_params,
+              fallback_keys=fallback_keys,
+          )
+          gate = sonar_get(
+              "/api/qualitygates/project_status",
+              gate_params,
+              fallback_keys=fallback_keys,
+          )
+
+          metric_map = {}
+          for m in measures.get("component", {}).get("measures", []):
+              metric_map[m.get("metric")] = m.get("value")
+
+          coverage = metric_map.get("coverage", "N/A")
+          new_coverage = metric_map.get("new_coverage", "N/A")
+
+          gate_status = gate.get("projectStatus", {}).get("status", "N/A")
+          conditions = gate.get("projectStatus", {}).get("conditions", [])
+
+          required_coverage = "N/A"
+          required_new_coverage = "N/A"
+
+          for c in conditions:
+              metric = c.get("metricKey")
+              threshold = c.get("errorThreshold", "N/A")
+              if metric == "coverage":
+                  required_coverage = threshold
+              elif metric == "new_coverage":
+                  required_new_coverage = threshold
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"sonar_dashboard_url={dashboard_url}\n")
+              f.write(f"sonar_coverage={coverage}\n")
+              f.write(f"sonar_new_coverage={new_coverage}\n")
+              f.write(f"sonar_required_coverage={required_coverage}\n")
+              f.write(f"sonar_required_new_coverage={required_new_coverage}\n")
+              f.write(f"sonar_quality_gate_status_api={gate_status}\n")
+          PY
+
+      - name: Summary 📄
+        if: ${{ inputs.sonar_enabled && always() }}
+        run: |
+          {
+            echo "## SonarQube Analysis Summary 🧫"
+            if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "pull_request_target" ]]; then
+              echo "- ✅ PR: #${{ github.event.pull_request.number }} (\`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`)"
+            else
+              echo "- ✅ Branch: \`${{ github.ref_name }}\`"
+            fi
+            echo "- ✅ Project: \`${{ inputs.sonar_project_key }}\`"
+            echo "- 🧪 Unit tests enabled: \`${{ inputs.unit_tests_enabled }}\`"
+            echo "- 📊 Coverage file: \`${{ inputs.sonar_coverage }}\`"
+            echo "- 📊 Coverage found: \`${{ steps.cov.outputs.found || 'false' }}\`"
+            echo "- ✅ Dashboard: ${{ steps.dashboard.outputs.sonar_dashboard_url || 'not-generated' }}"
+            echo "- ✅ QualityGate: \`${{ steps.quality-gate.outputs.quality-gate-status || 'none' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,1417 @@
+name: Deploy Cloud Run 🚀
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'Runner labels em JSON. Ex.: ["self-hosted","dev"]'
+        required: false
+        type: string
+        default: '["self-hosted","dev"]'
+
+      environment:
+        description: "GitHub Environment usado pelo job (Dev, HML, PRD)"
+        required: false
+        type: string
+        default: Dev
+
+      config_file:
+        description: "Arquivo YAML obrigatório da aplicação. Ex.: .cloudrun/dev.yaml, .cloudrun/hml.yaml ou .cloudrun/prd.yaml"
+        required: true
+        type: string
+
+      project_id:
+        description: "Project ID onde o serviço Cloud Run será implantado. Vazio => vars.GCP_PROJECT_ID"
+        required: false
+        type: string
+        default: ""
+
+      region:
+        description: "Região do Cloud Run. Vazio => vars.GCP_REGION ou southamerica-east1"
+        required: false
+        type: string
+        default: ""
+
+      service_name:
+        description: "Nome do serviço. Se vazio, usa o nome do repositório sanitizado"
+        required: false
+        type: string
+        default: ""
+
+      image_ref:
+        description: "Imagem completa do GAR, preferencialmente por digest: host/projeto/repo/app@sha256:..."
+        required: true
+        type: string
+
+      expected_image_digest:
+        description: "Digest esperado após o deploy. Usado para validar deploy por tag em PRD. Ex.: sha256:<64 hex>"
+        required: false
+        type: string
+        default: ""
+
+      require_image_digest:
+        description: "Exigir imagem imutável no formato @sha256:<64 hex>"
+        required: false
+        type: boolean
+        default: true
+
+      revision_tag:
+        description: "Revision tag opcional do Cloud Run. Em PRD, informe o SemVer (ex.: v1.2.3); será sanitizado para v1-2-3"
+        required: false
+        type: string
+        default: ""
+
+      gcp_workload_identity_provider:
+        description: "Provider WIF. Vazio => vars.GCP_WIF_PROVIDER"
+        required: false
+        type: string
+        default: ""
+
+      gcp_deploy_service_account:
+        description: "Service Account de deploy. Vazio => vars.GCP_DEPLOY_SERVICE_ACCOUNT ou vars.GCP_SERVICE_ACCOUNT"
+        required: false
+        type: string
+        default: ""
+
+      runtime_service_account:
+        description: "Service Account usada pela revisão do Cloud Run. Vazio => vars.GCP_RUNTIME_SERVICE_ACCOUNT ou preserva/default"
+        required: false
+        type: string
+        default: ""
+
+      gcloud_version:
+        description: "Versão do Google Cloud SDK"
+        required: false
+        type: string
+        default: latest
+
+      timeout_job:
+        description: "Timeout do job em minutos"
+        required: false
+        type: number
+        default: 30
+
+    outputs:
+      project_id:
+        description: "Project ID efetivamente utilizado"
+        value: ${{ jobs.deploy.outputs.project_id }}
+      region:
+        description: "Região efetivamente utilizada"
+        value: ${{ jobs.deploy.outputs.region }}
+      service_name:
+        description: "Nome final do serviço Cloud Run"
+        value: ${{ jobs.deploy.outputs.service_name }}
+      service_url:
+        description: "URL do serviço Cloud Run"
+        value: ${{ jobs.deploy.outputs.service_url }}
+      revision:
+        description: "Revisão criada e validada após o deploy"
+        value: ${{ jobs.deploy.outputs.revision }}
+      revision_tag:
+        description: "Revision tag aplicada à revisão implantada"
+        value: ${{ jobs.deploy.outputs.revision_tag }}
+      image_ref:
+        description: "Imagem solicitada para o deploy"
+        value: ${{ jobs.deploy.outputs.image_ref }}
+      deployed_image_digest:
+        description: "Digest efetivamente resolvido na revisão do Cloud Run"
+        value: ${{ jobs.deploy.outputs.deployed_image_digest }}
+      config_file:
+        description: "Arquivo de configuração efetivamente utilizado"
+        value: ${{ jobs.deploy.outputs.config_file }}
+      labels:
+        description: "Labels finais aplicadas ao serviço/revisão"
+        value: ${{ jobs.deploy.outputs.labels }}
+
+permissions:
+  contents: read
+  id-token: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: Deploy Cloud Run ${{ inputs.environment }} 🚀
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    timeout-minutes: ${{ inputs.timeout_job }}
+
+    environment:
+      name: ${{ inputs.environment }}
+
+    concurrency:
+      group: cloud-run-${{ github.repository }}-${{ inputs.environment }}-${{ inputs.project_id || vars.GCP_PROJECT_ID }}-${{ inputs.region || vars.GCP_REGION || 'southamerica-east1' }}-${{ inputs.service_name || github.event.repository.name }}
+      cancel-in-progress: true
+
+    outputs:
+      project_id: ${{ steps.context.outputs.project_id }}
+      region: ${{ steps.context.outputs.region }}
+      service_name: ${{ steps.context.outputs.service_name }}
+      service_url: ${{ steps.inspect.outputs.service_url }}
+      revision: ${{ steps.inspect.outputs.revision }}
+      revision_tag: ${{ steps.revision_tag.outputs.revision_tag }}
+      image_ref: ${{ steps.context.outputs.image_ref }}
+      deployed_image_digest: ${{ steps.inspect.outputs.deployed_image_digest }}
+      config_file: ${{ steps.config.outputs.config_file }}
+      labels: ${{ steps.config.outputs.labels }}
+
+    steps:
+      - name: Checkout Application Repository 📥
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Resolve Context 🧠
+        id: context
+        env:
+          INPUT_PROJECT_ID: ${{ inputs.project_id }}
+          INPUT_REGION: ${{ inputs.region }}
+          INPUT_SERVICE_NAME: ${{ inputs.service_name }}
+          INPUT_IMAGE_REF: ${{ inputs.image_ref }}
+          INPUT_WIF_PROVIDER: ${{ inputs.gcp_workload_identity_provider }}
+          INPUT_DEPLOY_SA: ${{ inputs.gcp_deploy_service_account }}
+          INPUT_RUNTIME_SA: ${{ inputs.runtime_service_account }}
+          VAR_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          VAR_REGION: ${{ vars.GCP_REGION }}
+          VAR_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          VAR_DEPLOY_SA: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          VAR_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          VAR_RUNTIME_SA: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
+          REQUIRE_DIGEST: ${{ inputs.require_image_digest }}
+          INPUT_EXPECTED_DIGEST: ${{ inputs.expected_image_digest }}
+        run: |
+          set -euo pipefail
+
+          sanitize_service_name() {
+            local value="$1"
+
+            value="$(printf '%s' "$value" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+
+            if [[ ! "$value" =~ ^[a-z] ]]; then
+              value="app-${value}"
+            fi
+
+            value="${value:0:49}"
+            value="${value%-}"
+            printf '%s' "$value"
+          }
+
+          PROJECT_ID="${INPUT_PROJECT_ID:-${VAR_PROJECT_ID:-}}"
+          REGION="${INPUT_REGION:-${VAR_REGION:-southamerica-east1}}"
+          RAW_SERVICE_NAME="${INPUT_SERVICE_NAME:-${GITHUB_REPOSITORY##*/}}"
+          SERVICE_NAME="$(sanitize_service_name "$RAW_SERVICE_NAME")"
+          IMAGE_REF="${INPUT_IMAGE_REF}"
+          WIF_PROVIDER="${INPUT_WIF_PROVIDER:-${VAR_WIF_PROVIDER:-}}"
+          DEPLOY_SA="${INPUT_DEPLOY_SA:-${VAR_DEPLOY_SA:-${VAR_SERVICE_ACCOUNT:-}}}"
+          RUNTIME_SA="${INPUT_RUNTIME_SA:-${VAR_RUNTIME_SA:-}}"
+          EXPECTED_DIGEST="${INPUT_EXPECTED_DIGEST:-}"
+
+          if [[ -z "$EXPECTED_DIGEST" && "$IMAGE_REF" =~ @((sha256:)[a-fA-F0-9]{64})$ ]]; then
+            EXPECTED_DIGEST="${BASH_REMATCH[1],,}"
+          fi
+
+          : "${PROJECT_ID:?Defina inputs.project_id ou vars.GCP_PROJECT_ID}"
+          : "${REGION:?Defina inputs.region ou vars.GCP_REGION}"
+          : "${SERVICE_NAME:?service_name ficou vazio após sanitização}"
+          : "${IMAGE_REF:?inputs.image_ref é obrigatório}"
+          : "${WIF_PROVIDER:?Defina inputs.gcp_workload_identity_provider ou vars.GCP_WIF_PROVIDER}"
+          : "${DEPLOY_SA:?Defina inputs.gcp_deploy_service_account, vars.GCP_DEPLOY_SERVICE_ACCOUNT ou vars.GCP_SERVICE_ACCOUNT}"
+
+          if [[ ! "$SERVICE_NAME" =~ ^[a-z]([a-z0-9-]{0,47}[a-z0-9])?$ ]]; then
+            echo "::error::Nome de serviço Cloud Run inválido após sanitização: ${SERVICE_NAME}"
+            exit 1
+          fi
+
+          if [[ "$REQUIRE_DIGEST" == "true" && ! "$IMAGE_REF" =~ @sha256:[a-fA-F0-9]{64}$ ]]; then
+            echo "::error::A promoção exige imagem imutável por digest: host/projeto/repo/imagem@sha256:<64 hex>. Recebido: ${IMAGE_REF}"
+            exit 1
+          fi
+
+          if [[ -n "$EXPECTED_DIGEST" && ! "$EXPECTED_DIGEST" =~ ^sha256:[a-fA-F0-9]{64}$ ]]; then
+            echo "::error::expected_image_digest inválido: ${EXPECTED_DIGEST}"
+            exit 1
+          fi
+
+          if [[ ! "$WIF_PROVIDER" =~ ^projects/[0-9]+/locations/global/workloadIdentityPools/[^/]+/providers/[^/]+$ ]]; then
+            echo "::error::Provider WIF inválido: ${WIF_PROVIDER}"
+            exit 1
+          fi
+
+          if [[ ! "$DEPLOY_SA" =~ ^[^@[:space:]]+@[^@[:space:]]+\.iam\.gserviceaccount\.com$ ]]; then
+            echo "::error::Service Account de deploy inválida: ${DEPLOY_SA}"
+            exit 1
+          fi
+
+          if [[ -n "$RUNTIME_SA" && ! "$RUNTIME_SA" =~ ^[^@[:space:]]+@[^@[:space:]]+\.iam\.gserviceaccount\.com$ ]]; then
+            echo "::error::Runtime Service Account inválida: ${RUNTIME_SA}"
+            exit 1
+          fi
+
+          {
+            echo "project_id=${PROJECT_ID}"
+            echo "region=${REGION}"
+            echo "service_name=${SERVICE_NAME}"
+            echo "image_ref=${IMAGE_REF}"
+            echo "wif_provider=${WIF_PROVIDER}"
+            echo "deploy_service_account=${DEPLOY_SA}"
+            echo "runtime_service_account=${RUNTIME_SA}"
+            echo "expected_image_digest=${EXPECTED_DIGEST,,}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Contexto Cloud Run"
+            echo "- Project: \`${PROJECT_ID}\`"
+            echo "- Region: \`${REGION}\`"
+            echo "- Service: \`${SERVICE_NAME}\`"
+            echo "- Image: \`${IMAGE_REF}\`"
+            echo "- Environment: \`${{ inputs.environment }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ensure YAML Parser 🧩
+        run: |
+          set -euo pipefail
+
+          if python3 -c 'import yaml' >/dev/null 2>&1; then
+            python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+            exit 0
+          fi
+
+          python3 -m pip install --user --disable-pip-version-check 'PyYAML>=6.0,<7'
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
+      - name: Resolve and Validate Application Configuration ⚙️
+        id: config
+        env:
+          CONFIG_FILE: ${{ inputs.config_file }}
+          ENVIRONMENT_NAME: ${{ inputs.environment }}
+          SERVICE_NAME: ${{ steps.context.outputs.service_name }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY_INNER'
+          import os
+          import re
+          import sys
+          import unicodedata
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError as exc:
+              print(f"::error::Não foi possível importar PyYAML: {exc}")
+              sys.exit(1)
+
+          config_file = os.environ.get("CONFIG_FILE", "").strip()
+          environment_name = os.environ.get("ENVIRONMENT_NAME", "").strip()
+          service_name = os.environ.get("SERVICE_NAME", "").strip()
+
+          if not config_file:
+              print("::error::config_file é obrigatório. Informe .cloudrun/<env>.yaml no caller.")
+              sys.exit(1)
+
+          path = Path(config_file)
+          if not path.is_file():
+              print(f"::error::Arquivo Cloud Run não encontrado: {config_file}")
+              sys.exit(1)
+
+          try:
+              data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+          except yaml.YAMLError as exc:
+              print(f"::error::YAML inválido em {config_file}: {exc}")
+              sys.exit(1)
+
+          if not isinstance(data, dict):
+              print("::error::A raiz do arquivo Cloud Run deve ser um objeto/mapa YAML.")
+              sys.exit(1)
+
+          required_top = {
+              "service", "network", "environment", "labels", "finops",
+              "traffic", "security", "healthcheck", "deploy",
+          }
+
+          unknown_top = sorted(set(data) - required_top)
+          missing_top = sorted(required_top - set(data))
+
+          if unknown_top:
+              print(f"::error::Chaves desconhecidas no arquivo Cloud Run: {', '.join(unknown_top)}")
+              sys.exit(1)
+
+          if missing_top:
+              print(f"::error::Seções obrigatórias ausentes no arquivo Cloud Run: {', '.join(missing_top)}")
+              sys.exit(1)
+
+          schema = {
+              "service": {
+                  "port", "cpu", "memory", "min_instances", "max_instances",
+                  "concurrency", "request_timeout", "execution_environment",
+                  "cpu_allocation", "startup_cpu_boost", "session_affinity",
+              },
+              "network": {
+                  "ingress", "vpc_connector", "network", "subnet",
+                  "network_tags", "vpc_egress", "cloud_sql_instances",
+              },
+              "environment": {
+                  "variables", "secrets", "update_strategy", "secrets_update_strategy",
+              },
+              "finops": {
+                  "enabled", "required", "cost_center", "business_unit",
+                  "product", "team", "owner", "criticality", "data_classification",
+              },
+              "traffic": {
+                  "revision_suffix", "tag", "no_traffic", "revision_traffic", "tag_traffic",
+              },
+              "security": {"invoker_iam"},
+              "healthcheck": {
+                  "deploy_enabled", "post_deploy_enabled", "path", "auth",
+                  "expected_status", "attempts", "delay_seconds",
+              },
+              "deploy": {"skip_default_labels", "extra_flags"},
+          }
+
+          def section(name):
+              value = data.get(name)
+              if not isinstance(value, dict):
+                  print(f"::error::A seção '{name}' deve ser um mapa YAML.")
+                  sys.exit(1)
+
+              unknown = sorted(set(value) - schema[name])
+              missing = sorted(schema[name] - set(value))
+
+              if unknown:
+                  print(f"::error::Chaves desconhecidas em '{name}': {', '.join(unknown)}")
+                  sys.exit(1)
+
+              if missing:
+                  print(f"::error::Chaves obrigatórias ausentes em '{name}': {', '.join(missing)}")
+                  sys.exit(1)
+
+              return value
+
+          service = section("service")
+          network = section("network")
+          environment = section("environment")
+          finops = section("finops")
+          traffic = section("traffic")
+          security = section("security")
+          healthcheck = section("healthcheck")
+          deploy_cfg = section("deploy")
+
+          labels_cfg = data.get("labels")
+          if not isinstance(labels_cfg, (dict, str)):
+              print("::error::A seção labels deve ser um mapa YAML ou uma string KEY=VALUE.")
+              sys.exit(1)
+
+          def scalar(value, name):
+              if value is None:
+                  return ""
+              if isinstance(value, bool):
+                  return "true" if value else "false"
+              if isinstance(value, (int, float)):
+                  return str(value)
+              if isinstance(value, str):
+                  return value.strip()
+
+              print(f"::error::{name} deve ser valor escalar. Recebido: {type(value).__name__}")
+              sys.exit(1)
+
+          def list_or_csv(value, name):
+              if value is None:
+                  return ""
+              if isinstance(value, list):
+                  return ",".join(str(item).strip() for item in value if str(item).strip())
+              if isinstance(value, str):
+                  return value.strip()
+
+              print(f"::error::{name} deve ser lista ou string.")
+              sys.exit(1)
+
+          def bool_text(value, name):
+              normalized = str(value).strip().lower()
+
+              if normalized in {"true", "1", "yes", "on"}:
+                  return "true"
+
+              if normalized in {"false", "0", "no", "off"}:
+                  return "false"
+
+              print(f"::error::{name} deve ser booleano. Recebido: {value!r}")
+              sys.exit(1)
+
+          def int_text(value, name, minimum=None):
+              raw = scalar(value, name)
+
+              if not re.fullmatch(r"-?[0-9]+", raw):
+                  print(f"::error::{name} deve ser número inteiro. Recebido: {value!r}")
+                  sys.exit(1)
+
+              number = int(raw)
+
+              if minimum is not None and number < minimum:
+                  print(f"::error::{name} deve ser maior ou igual a {minimum}. Recebido: {number}")
+                  sys.exit(1)
+
+              return str(number)
+
+          def pairs_to_lines(value, name, *, allow_mount_paths=False):
+              if value is None:
+                  return ""
+
+              if isinstance(value, dict):
+                  lines = []
+
+                  for key, item in value.items():
+                      key = str(key)
+                      is_env_key = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                      is_mount_path = (
+                          allow_mount_paths
+                          and re.fullmatch(r"/(?:[^/=\s]+/)*[^/=\s]+", key)
+                      )
+
+                      if not is_env_key and not is_mount_path:
+                          print(f"::error::Chave inválida em {name}: {key}")
+                          sys.exit(1)
+
+                      if isinstance(item, (dict, list)):
+                          print(f"::error::Valor de {name}.{key} deve ser escalar.")
+                          sys.exit(1)
+
+                      lines.append(f"{key}={'' if item is None else item}")
+
+                  return "\n".join(lines)
+
+              if isinstance(value, list):
+                  return "\n".join(str(item) for item in value)
+
+              if isinstance(value, str):
+                  return value.strip()
+
+              print(f"::error::{name} deve ser mapa, lista ou string.")
+              sys.exit(1)
+
+          def parse_label_string(value):
+              result = {}
+
+              if not value:
+                  return result
+
+              raw_items = []
+              for line in str(value).splitlines():
+                  raw_items.extend(part for part in line.split(",") if part.strip())
+
+              for item in raw_items:
+                  if "=" not in item:
+                      print(f"::error::Label inválida, esperado KEY=VALUE: {item}")
+                      sys.exit(1)
+
+                  key, val = item.split("=", 1)
+                  result[key.strip()] = val.strip()
+
+              return result
+
+          def label_token(value, *, key=False):
+              token = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+              token = token.lower().strip()
+              token = re.sub(r"[^a-z0-9_-]+", "-", token)
+              token = re.sub(r"[-_]{2,}", "-", token).strip("-_")
+
+              if key and token and not token[0].isalpha():
+                  token = f"label-{token}"
+
+              return token[:63].rstrip("-_")
+
+          def validate_enum(name, value, allowed):
+              if value not in allowed:
+                  print(f"::error::{name} inválido: '{value}'. Permitidos: {', '.join(repr(item) for item in allowed)}")
+                  sys.exit(1)
+
+          resolved = {
+              "port": scalar(service["port"], "service.port"),
+              "cpu": scalar(service["cpu"], "service.cpu"),
+              "memory": scalar(service["memory"], "service.memory"),
+              "min_instances": scalar(service["min_instances"], "service.min_instances"),
+              "max_instances": scalar(service["max_instances"], "service.max_instances"),
+              "concurrency": scalar(service["concurrency"], "service.concurrency"),
+              "request_timeout": scalar(service["request_timeout"], "service.request_timeout"),
+              "execution_environment": scalar(service["execution_environment"], "service.execution_environment"),
+              "cpu_allocation": scalar(service["cpu_allocation"], "service.cpu_allocation"),
+              "startup_cpu_boost": scalar(service["startup_cpu_boost"], "service.startup_cpu_boost"),
+              "session_affinity": scalar(service["session_affinity"], "service.session_affinity"),
+              "ingress": scalar(network["ingress"], "network.ingress"),
+              "vpc_connector": scalar(network["vpc_connector"], "network.vpc_connector"),
+              "network": scalar(network["network"], "network.network"),
+              "subnet": scalar(network["subnet"], "network.subnet"),
+              "network_tags": list_or_csv(network["network_tags"], "network.network_tags"),
+              "vpc_egress": scalar(network["vpc_egress"], "network.vpc_egress"),
+              "cloud_sql_instances": list_or_csv(network["cloud_sql_instances"], "network.cloud_sql_instances"),
+              "env_vars_update_strategy": scalar(environment["update_strategy"], "environment.update_strategy"),
+              "secrets_update_strategy": scalar(environment["secrets_update_strategy"], "environment.secrets_update_strategy"),
+              "revision_suffix": scalar(traffic["revision_suffix"], "traffic.revision_suffix"),
+              "traffic_tag": scalar(traffic["tag"], "traffic.tag"),
+              "revision_traffic": scalar(traffic["revision_traffic"], "traffic.revision_traffic"),
+              "tag_traffic": scalar(traffic["tag_traffic"], "traffic.tag_traffic"),
+              "invoker_iam": scalar(security["invoker_iam"], "security.invoker_iam"),
+              "healthcheck_path": scalar(healthcheck["path"], "healthcheck.path"),
+              "healthcheck_auth": scalar(healthcheck["auth"], "healthcheck.auth"),
+              "healthcheck_expected_status": scalar(healthcheck["expected_status"], "healthcheck.expected_status"),
+              "healthcheck_attempts": int_text(healthcheck["attempts"], "healthcheck.attempts", minimum=1),
+              "healthcheck_delay_seconds": int_text(healthcheck["delay_seconds"], "healthcheck.delay_seconds", minimum=0),
+              "extra_flags": scalar(deploy_cfg["extra_flags"], "deploy.extra_flags"),
+              "env_vars": pairs_to_lines(environment["variables"], "environment.variables"),
+              "secret_env_vars": pairs_to_lines(
+                  environment["secrets"],
+                  "environment.secrets",
+                  allow_mount_paths=True,
+              ),
+              "no_traffic": bool_text(traffic["no_traffic"], "traffic.no_traffic"),
+              "skip_default_labels": bool_text(deploy_cfg["skip_default_labels"], "deploy.skip_default_labels"),
+              "deploy_health_check": bool_text(healthcheck["deploy_enabled"], "healthcheck.deploy_enabled"),
+              "post_deploy_healthcheck": bool_text(healthcheck["post_deploy_enabled"], "healthcheck.post_deploy_enabled"),
+              "config_file": config_file,
+          }
+
+          validate_enum("service.execution_environment", resolved["execution_environment"], {"", "gen1", "gen2"})
+          validate_enum("network.ingress", resolved["ingress"], {"", "all", "internal", "internal-and-cloud-load-balancing"})
+          validate_enum("service.cpu_allocation", resolved["cpu_allocation"], {"preserve", "request", "always"})
+          validate_enum("service.startup_cpu_boost", resolved["startup_cpu_boost"], {"preserve", "enabled", "disabled"})
+          validate_enum("service.session_affinity", resolved["session_affinity"], {"preserve", "enabled", "disabled"})
+          validate_enum("network.vpc_egress", resolved["vpc_egress"], {"", "private-ranges-only", "all-traffic"})
+          validate_enum("environment.update_strategy", resolved["env_vars_update_strategy"], {"merge", "overwrite"})
+          validate_enum("environment.secrets_update_strategy", resolved["secrets_update_strategy"], {"merge", "overwrite"})
+          validate_enum("security.invoker_iam", resolved["invoker_iam"], {"preserve", "public", "private"})
+          validate_enum("healthcheck.auth", resolved["healthcheck_auth"], {"auto", "public", "private"})
+
+          if resolved["vpc_connector"] and resolved["network"]:
+              print("::error::network.vpc_connector é mutuamente exclusivo com network.network/network.subnet.")
+              sys.exit(1)
+
+          if resolved["subnet"] and not resolved["network"]:
+              print("::error::network.subnet exige que network.network também seja informado.")
+              sys.exit(1)
+
+          if resolved["tag_traffic"] and resolved["revision_traffic"]:
+              print("::error::traffic.tag_traffic e traffic.revision_traffic são mutuamente exclusivos.")
+              sys.exit(1)
+
+          if resolved["no_traffic"] == "true" and (resolved["tag_traffic"] or resolved["revision_traffic"]):
+              print("::error::traffic.no_traffic=true não pode ser combinado com tag_traffic ou revision_traffic.")
+              sys.exit(1)
+
+          if not re.fullmatch(r"[0-9]{3}(-[0-9]{3})?", resolved["healthcheck_expected_status"]):
+              print("::error::healthcheck.expected_status deve ser um código ou intervalo. Ex.: 200 ou 200-399.")
+              sys.exit(1)
+
+          if resolved["skip_default_labels"] == "false":
+              print("::warning::deploy.skip_default_labels=false adiciona labels padrão da action, incluindo managed-by=github-actions e commit-sha. O padrão Releaseflow recomendado é true.")
+
+          base_labels = {
+              "environment": label_token(environment_name),
+              "application": label_token(service_name),
+              "service": label_token(service_name),
+              "platform": "cloud-run",
+              "managed-by": "releaseflow",
+          }
+
+          finops_enabled = bool_text(finops["enabled"], "finops.enabled") == "true"
+          finops_required = bool_text(finops["required"], "finops.required") == "true"
+
+          finops_map = {
+              "cost-center": finops["cost_center"],
+              "business-unit": finops["business_unit"],
+              "product": finops["product"],
+              "team": finops["team"],
+              "owner": finops["owner"],
+              "criticality": finops["criticality"],
+              "data-classification": finops["data_classification"],
+          }
+
+          required_finops = ("cost-center", "business-unit", "product", "team")
+
+          if finops_enabled and finops_required:
+              missing = [key for key in required_finops if not str(finops_map.get(key, "")).strip()]
+              if missing:
+                  print(f"::error::Labels FinOps obrigatórias ausentes em {config_file}: {', '.join(missing)}")
+                  sys.exit(1)
+
+          final_labels = dict(base_labels)
+
+          if finops_enabled:
+              for key, value in finops_map.items():
+                  if str(value).strip():
+                      final_labels[key] = label_token(value)
+
+          if isinstance(labels_cfg, dict):
+              file_labels = labels_cfg
+          else:
+              file_labels = parse_label_string(labels_cfg)
+
+          protected = set(final_labels)
+
+          for raw_key, raw_value in file_labels.items():
+              key = label_token(raw_key, key=True)
+              value = label_token(raw_value)
+
+              if not key:
+                  print(f"::error::Label com chave vazia no arquivo: {raw_key!r}")
+                  sys.exit(1)
+
+              if key in protected and final_labels.get(key) != value:
+                  print(f"::error::A label governada '{key}' não pode ser sobrescrita pelo arquivo.")
+                  sys.exit(1)
+
+              final_labels[key] = value
+
+          resolved["labels"] = "\n".join(
+              f"{key}={value}" for key, value in sorted(final_labels.items())
+          )
+
+          def output(name, value):
+              value = "" if value is None else str(value)
+
+              if "\n" in value:
+                  delimiter = f"CLOUDRUN_{name.upper()}_EOF"
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+                      handle.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
+              else:
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+                      handle.write(f"{name}={value}\n")
+
+          for key, value in resolved.items():
+              output(key, value)
+
+          print(f"Configuração carregada e validada: {config_file}")
+          print("Labels finais:")
+          print(resolved["labels"])
+          PY_INNER
+
+      - name: Authenticate to Google Cloud 🔐
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ steps.context.outputs.project_id }}
+          workload_identity_provider: ${{ steps.context.outputs.wif_provider }}
+          service_account: ${{ steps.context.outputs.deploy_service_account }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Setup Google Cloud SDK ☁️
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ${{ inputs.gcloud_version }}
+          project_id: ${{ steps.context.outputs.project_id }}
+
+      - name: Validate Google Cloud Access 🔎
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ steps.context.outputs.region }}
+          DEPLOY_SA: ${{ steps.context.outputs.deploy_service_account }}
+        run: |
+          set -euo pipefail
+
+          ACTIVE_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' | head -n1)"
+          if [[ -z "$ACTIVE_ACCOUNT" ]]; then
+            echo "::error::Nenhuma identidade ativa foi encontrada no gcloud."
+            exit 1
+          fi
+
+          gcloud config set project "$PROJECT_ID" --quiet
+
+          if [[ ! "$REGION" =~ ^[a-z][a-z0-9-]*[a-z0-9]$ ]]; then
+            echo "::error::Formato de região inválido: ${REGION}"
+            exit 1
+          fi
+
+          echo "Identidade ativa: ${ACTIVE_ACCOUNT}"
+          echo "Service Account solicitada: ${DEPLOY_SA}"
+
+      - name: Build Deploy Flags ⚙️
+        id: flags
+        env:
+          RUNTIME_SA: ${{ steps.context.outputs.runtime_service_account }}
+          PORT: ${{ steps.config.outputs.port }}
+          CPU: ${{ steps.config.outputs.cpu }}
+          MEMORY: ${{ steps.config.outputs.memory }}
+          MIN_INSTANCES: ${{ steps.config.outputs.min_instances }}
+          MAX_INSTANCES: ${{ steps.config.outputs.max_instances }}
+          CONCURRENCY: ${{ steps.config.outputs.concurrency }}
+          EXECUTION_ENVIRONMENT: ${{ steps.config.outputs.execution_environment }}
+          INGRESS: ${{ steps.config.outputs.ingress }}
+          CPU_ALLOCATION: ${{ steps.config.outputs.cpu_allocation }}
+          STARTUP_CPU_BOOST: ${{ steps.config.outputs.startup_cpu_boost }}
+          SESSION_AFFINITY: ${{ steps.config.outputs.session_affinity }}
+          VPC_CONNECTOR: ${{ steps.config.outputs.vpc_connector }}
+          NETWORK: ${{ steps.config.outputs.network }}
+          SUBNET: ${{ steps.config.outputs.subnet }}
+          NETWORK_TAGS: ${{ steps.config.outputs.network_tags }}
+          VPC_EGRESS: ${{ steps.config.outputs.vpc_egress }}
+          CLOUD_SQL_INSTANCES: ${{ steps.config.outputs.cloud_sql_instances }}
+          DEPLOY_HEALTH_CHECK: ${{ steps.config.outputs.deploy_health_check }}
+          EXTRA_FLAGS: ${{ steps.config.outputs.extra_flags }}
+        run: |
+          set -euo pipefail
+
+          flags=()
+
+          add_flag() {
+            local name="$1"
+            local value="${2:-}"
+
+            if [[ -n "$value" ]]; then
+              flags+=("--${name}=${value}")
+            fi
+
+            return 0
+          }
+
+          add_flag service-account "$RUNTIME_SA"
+          add_flag port "$PORT"
+          add_flag cpu "$CPU"
+          add_flag memory "$MEMORY"
+          add_flag min-instances "$MIN_INSTANCES"
+          add_flag max-instances "$MAX_INSTANCES"
+          add_flag concurrency "$CONCURRENCY"
+          add_flag execution-environment "$EXECUTION_ENVIRONMENT"
+          add_flag ingress "$INGRESS"
+          add_flag vpc-connector "$VPC_CONNECTOR"
+          add_flag network "$NETWORK"
+          add_flag subnet "$SUBNET"
+          add_flag network-tags "$NETWORK_TAGS"
+          add_flag vpc-egress "$VPC_EGRESS"
+          add_flag set-cloudsql-instances "$CLOUD_SQL_INSTANCES"
+
+          case "$CPU_ALLOCATION" in
+            request) flags+=("--cpu-throttling") ;;
+            always) flags+=("--no-cpu-throttling") ;;
+          esac
+
+          case "$STARTUP_CPU_BOOST" in
+            enabled) flags+=("--cpu-boost") ;;
+            disabled) flags+=("--no-cpu-boost") ;;
+          esac
+
+          case "$SESSION_AFFINITY" in
+            enabled) flags+=("--session-affinity") ;;
+            disabled) flags+=("--no-session-affinity") ;;
+          esac
+
+          if [[ "$DEPLOY_HEALTH_CHECK" == "true" ]]; then
+            flags+=("--deploy-health-check")
+          else
+            flags+=("--no-deploy-health-check")
+          fi
+
+          FLAGS_STRING="${flags[*]}"
+
+          if [[ -n "$EXTRA_FLAGS" ]]; then
+            FLAGS_STRING="${FLAGS_STRING} ${EXTRA_FLAGS}"
+          fi
+
+          {
+            echo "flags<<CLOUD_RUN_FLAGS"
+            echo "$FLAGS_STRING"
+            echo "CLOUD_RUN_FLAGS"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Flags controladas montadas com sucesso."
+
+      - name: Deploy Cloud Run Revision 🚀
+        id: deploy_cloud_run
+        uses: google-github-actions/deploy-cloudrun@v3
+        with:
+          project_id: ${{ steps.context.outputs.project_id }}
+          region: ${{ steps.context.outputs.region }}
+          service: ${{ steps.context.outputs.service_name }}
+          image: ${{ steps.context.outputs.image_ref }}
+          suffix: ${{ steps.config.outputs.revision_suffix }}
+          env_vars: ${{ steps.config.outputs.env_vars }}
+          env_vars_update_strategy: ${{ steps.config.outputs.env_vars_update_strategy }}
+          secrets: ${{ steps.config.outputs.secret_env_vars }}
+          secrets_update_strategy: ${{ steps.config.outputs.secrets_update_strategy }}
+          labels: ${{ steps.config.outputs.labels }}
+          skip_default_labels: ${{ steps.config.outputs.skip_default_labels }}
+          tag: ${{ steps.config.outputs.traffic_tag }}
+          timeout: ${{ steps.config.outputs.request_timeout }}
+          flags: ${{ steps.flags.outputs.flags }}
+          no_traffic: ${{ steps.config.outputs.no_traffic }}
+          revision_traffic: ${{ steps.config.outputs.revision_traffic }}
+          tag_traffic: ${{ steps.config.outputs.tag_traffic }}
+          gcloud_version: ${{ inputs.gcloud_version }}
+
+      - name: Manage Invoker IAM 🔒
+        if: ${{ steps.config.outputs.invoker_iam != 'preserve' }}
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ steps.context.outputs.region }}
+          SERVICE_NAME: ${{ steps.context.outputs.service_name }}
+          INVOKER_IAM: ${{ steps.config.outputs.invoker_iam }}
+        run: |
+          set -euo pipefail
+
+          # A org policy pode exigir o IAM invoker check habilitado. Mantemos
+          # o check ligado para public e private e controlamos exposição via IAM.
+          gcloud run services update "$SERVICE_NAME" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --invoker-iam-check \
+            --quiet
+
+          POLICY_FILE="$(mktemp)"
+          gcloud run services get-iam-policy "$SERVICE_NAME" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --format=json > "$POLICY_FILE"
+
+          HAS_PUBLIC="$(POLICY_FILE="$POLICY_FILE" python3 <<'PY'
+          import json
+          import os
+
+          with open(os.environ["POLICY_FILE"], encoding="utf-8") as handle:
+              policy = json.load(handle)
+
+          found = any(
+              binding.get("role") == "roles/run.invoker"
+              and "allUsers" in binding.get("members", [])
+              for binding in policy.get("bindings", [])
+          )
+
+          print("true" if found else "false")
+          PY
+          )"
+
+          if [[ "$INVOKER_IAM" == "public" ]]; then
+            if [[ "$HAS_PUBLIC" == "true" ]]; then
+              echo "O serviço já possui allUsers com roles/run.invoker."
+            else
+              gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
+                --project="$PROJECT_ID" \
+                --region="$REGION" \
+                --member="allUsers" \
+                --role="roles/run.invoker" \
+                --quiet
+              echo "Acesso público configurado via allUsers com roles/run.invoker."
+            fi
+            exit 0
+          fi
+
+          if [[ "$HAS_PUBLIC" == "true" ]]; then
+            gcloud run services remove-iam-policy-binding "$SERVICE_NAME" \
+              --project="$PROJECT_ID" \
+              --region="$REGION" \
+              --member="allUsers" \
+              --role="roles/run.invoker" \
+              --quiet
+            echo "Acesso público removido; IAM invoker check permanece habilitado."
+          else
+            echo "O serviço já não possui allUsers com roles/run.invoker."
+          fi
+
+      - name: Inspect Deployment 🔍
+        id: inspect
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ steps.context.outputs.region }}
+          SERVICE_NAME: ${{ steps.context.outputs.service_name }}
+          EXPECTED_IMAGE: ${{ steps.context.outputs.image_ref }}
+          EXPECTED_DIGEST: ${{ steps.context.outputs.expected_image_digest }}
+        run: |
+          set -euo pipefail
+
+          SERVICE_FILE="$(mktemp)"
+          REVISION_FILE="$(mktemp)"
+          MAX_ATTEMPTS=60
+          DELAY_SECONDS=5
+
+          gcloud run services describe "$SERVICE_NAME" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --platform=managed \
+            --format=json > "$SERVICE_FILE"
+
+          REVISION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",{}).get("latestCreatedRevisionName",""))' "$SERVICE_FILE")"
+          : "${REVISION:?Cloud Run não retornou latestCreatedRevisionName}"
+
+          echo "Revisão criada pelo deploy: ${REVISION}"
+          revision_ready="false"
+
+          for (( attempt=1; attempt<=MAX_ATTEMPTS; attempt++ )); do
+            gcloud run services describe "$SERVICE_NAME" \
+              --project="$PROJECT_ID" \
+              --region="$REGION" \
+              --platform=managed \
+              --format=json > "$SERVICE_FILE"
+
+            CURRENT_CREATED="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",{}).get("latestCreatedRevisionName",""))' "$SERVICE_FILE")"
+
+            if [[ "$CURRENT_CREATED" != "$REVISION" ]]; then
+              echo "::error::Uma nova revisão foi criada durante a validação. Esperada: ${REVISION}; atual: ${CURRENT_CREATED:-<vazia>}"
+              exit 1
+            fi
+
+            gcloud run revisions describe "$REVISION" \
+              --project="$PROJECT_ID" \
+              --region="$REGION" \
+              --platform=managed \
+              --format=json > "$REVISION_FILE"
+
+            REVISION_STATE="$(REVISION_FILE="$REVISION_FILE" python3 <<'PY'
+          import json
+          import os
+
+          with open(os.environ["REVISION_FILE"], encoding="utf-8") as handle:
+              revision = json.load(handle)
+
+          ready = next(
+              (condition for condition in revision.get("status", {}).get("conditions", []) if condition.get("type") == "Ready"),
+              {},
+          )
+          status = str(ready.get("status", "")).lower()
+
+          if status == "true":
+              print("ready")
+          elif status == "false":
+              print("failed")
+          else:
+              print("pending")
+          PY
+            )"
+
+            if [[ "$REVISION_STATE" == "failed" ]]; then
+              REVISION_MESSAGE="$(REVISION_FILE="$REVISION_FILE" python3 <<'PY'
+          import json
+          import os
+
+          with open(os.environ["REVISION_FILE"], encoding="utf-8") as handle:
+              revision = json.load(handle)
+
+          ready = next(
+              (condition for condition in revision.get("status", {}).get("conditions", []) if condition.get("type") == "Ready"),
+              {},
+          )
+          print(ready.get("message", "Revisão reportou Ready=False"))
+          PY
+              )"
+              echo "::error::Revisão ${REVISION} falhou: ${REVISION_MESSAGE}"
+              exit 1
+            fi
+
+            if [[ "$REVISION_STATE" == "ready" ]]; then
+              revision_ready="true"
+              break
+            fi
+
+            echo "Aguardando revisão ${REVISION} ficar pronta (${attempt}/${MAX_ATTEMPTS}). Estado=${REVISION_STATE}"
+
+            if (( attempt < MAX_ATTEMPTS )); then
+              sleep "$DELAY_SECONDS"
+            fi
+          done
+
+          if [[ "$revision_ready" != "true" ]]; then
+            echo "::error::Timeout aguardando a revisão ${REVISION} ficar Ready."
+            exit 1
+          fi
+
+          gcloud run services describe "$SERVICE_NAME" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --platform=managed \
+            --format=json > "$SERVICE_FILE"
+
+          SERVICE_FILE="$SERVICE_FILE" REVISION_FILE="$REVISION_FILE" REVISION="$REVISION" EXPECTED_IMAGE="$EXPECTED_IMAGE" EXPECTED_DIGEST="$EXPECTED_DIGEST" python3 <<'PY'
+          import json
+          import os
+          import sys
+
+          with open(os.environ["SERVICE_FILE"], encoding="utf-8") as handle:
+              service = json.load(handle)
+
+          with open(os.environ["REVISION_FILE"], encoding="utf-8") as handle:
+              revision_payload = json.load(handle)
+
+          status = service.get("status", {})
+          revision_ready_condition = next(
+              (condition for condition in revision_payload.get("status", {}).get("conditions", []) if condition.get("type") == "Ready"),
+              {},
+          )
+
+          revision_ready = str(revision_ready_condition.get("status", "")).lower() == "true"
+          url = status.get("url", "")
+          revision = os.environ["REVISION"].strip()
+          latest_created = status.get("latestCreatedRevisionName", "")
+          latest_ready = status.get("latestReadyRevisionName", "")
+
+          containers = revision_payload.get("spec", {}).get("containers", [])
+          deployed_image = containers[0].get("image", "") if containers else ""
+          expected_image = os.environ["EXPECTED_IMAGE"].strip().lower()
+
+          def normalize_digest(value):
+              value = (value or "").strip().lower()
+
+              if "@sha256:" in value:
+                  return "sha256:" + value.split("@sha256:", 1)[1]
+
+              return value
+
+          expected_digest = normalize_digest(os.environ.get("EXPECTED_DIGEST", ""))
+          raw_image_digest = revision_payload.get("status", {}).get("imageDigest", "")
+          deployed_digest = normalize_digest(raw_image_digest)
+
+          print(f"EXPECTED_IMAGE   = {expected_image}")
+          print(f"EXPECTED_DIGEST  = {expected_digest}")
+          print(f"REVISION         = {revision}")
+          print(f"LATEST_CREATED   = {latest_created}")
+          print(f"LATEST_READY     = {latest_ready}")
+          print(f"DEPLOYED_IMAGE   = {deployed_image}")
+          print(f"RAW_IMAGE_DIGEST = {raw_image_digest}")
+          print(f"DEPLOYED_DIGEST  = {deployed_digest}")
+
+          if not revision_ready:
+              message = revision_ready_condition.get("message", "Condição Ready não encontrada")
+              print(f"::error::Revisão Cloud Run não ficou Ready: {message}")
+              sys.exit(1)
+
+          if not url:
+              print("::error::Cloud Run não retornou URL para o serviço.")
+              sys.exit(1)
+
+          if not revision:
+              print("::error::Cloud Run não retornou latestCreatedRevisionName.")
+              sys.exit(1)
+
+          if latest_created != revision:
+              print(
+                  "::error::latestCreatedRevisionName mudou durante a validação.\n"
+                  f"Esperada: {revision}\n"
+                  f"Atual   : {latest_created or '<vazia>'}"
+              )
+              sys.exit(1)
+
+          if expected_digest:
+              if not deployed_digest:
+                  print("::error::Cloud Run não retornou status.imageDigest para a revisão criada.")
+                  sys.exit(1)
+
+              if deployed_digest != expected_digest:
+                  print(
+                      "::error::Digest da revisão divergente.\n"
+                      f"Esperado : {expected_digest}\n"
+                      f"Implantado: {deployed_digest}"
+                  )
+                  sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"service_url={url}\n")
+              output.write(f"revision={revision}\n")
+              output.write(f"deployed_image={deployed_image}\n")
+              output.write(f"deployed_image_digest={deployed_digest}\n")
+
+          print(f"Serviço disponível: {url}")
+          print(f"Revisão validada: {revision}")
+          print(f"Imagem solicitada: {expected_image}")
+          print(f"Imagem descrita na revisão: {deployed_image}")
+          print(f"Digest resolvido na revisão: {deployed_digest or '<não retornado>'}")
+          PY
+
+      - name: Promote PRD Traffic 🚦
+        if: >-
+          ${{
+            inputs.environment == 'PRD' &&
+            steps.config.outputs.no_traffic != 'true' &&
+            steps.config.outputs.revision_traffic == '' &&
+            steps.config.outputs.tag_traffic == ''
+          }}
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ steps.context.outputs.region }}
+          SERVICE_NAME: ${{ steps.context.outputs.service_name }}
+          REVISION: ${{ steps.inspect.outputs.revision }}
+        run: |
+          set -euo pipefail
+
+          : "${REVISION:?Inspect Deployment não retornou a revisão criada}"
+
+          gcloud run services update-traffic "$SERVICE_NAME" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --to-revisions="${REVISION}=100" \
+            --quiet
+
+          SERVICE_FILE="$(mktemp)"
+          MAX_ATTEMPTS=30
+          DELAY_SECONDS=2
+          traffic_ready="false"
+
+          for (( attempt=1; attempt<=MAX_ATTEMPTS; attempt++ )); do
+            gcloud run services describe "$SERVICE_NAME" \
+              --project="$PROJECT_ID" \
+              --region="$REGION" \
+              --platform=managed \
+              --format=json > "$SERVICE_FILE"
+
+            TRAFFIC_STATE="$(SERVICE_FILE="$SERVICE_FILE" REVISION="$REVISION" python3 <<'PY'
+          import json
+          import os
+
+          with open(os.environ["SERVICE_FILE"], encoding="utf-8") as handle:
+              service = json.load(handle)
+
+          expected_revision = os.environ["REVISION"]
+          traffic = service.get("status", {}).get("traffic", [])
+
+          primary_targets = [target for target in traffic if not target.get("tag")]
+          target_percent = sum(
+              int(target.get("percent") or 0)
+              for target in primary_targets
+              if target.get("revisionName") == expected_revision
+          )
+          other_percent = sum(
+              int(target.get("percent") or 0)
+              for target in primary_targets
+              if target.get("revisionName") != expected_revision
+          )
+
+          print("ready" if target_percent == 100 and other_percent == 0 else "pending")
+          PY
+            )"
+
+            if [[ "$TRAFFIC_STATE" == "ready" ]]; then
+              traffic_ready="true"
+              break
+            fi
+
+            echo "Aguardando 100% do tráfego em ${REVISION} (${attempt}/${MAX_ATTEMPTS})."
+
+            if (( attempt < MAX_ATTEMPTS )); then
+              sleep "$DELAY_SECONDS"
+            fi
+          done
+
+          if [[ "$traffic_ready" != "true" ]]; then
+            echo "::error::O Cloud Run não direcionou 100% do tráfego para a revisão ${REVISION}."
+            exit 1
+          fi
+
+          echo "Tráfego PRD validado: ${REVISION}=100%."
+
+      - name: Tag Cloud Run Revision 🏷️
+        id: revision_tag
+        if: ${{ inputs.environment == 'PRD' && inputs.revision_tag != '' }}
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ steps.context.outputs.region }}
+          SERVICE_NAME: ${{ steps.context.outputs.service_name }}
+          REVISION: ${{ steps.inspect.outputs.revision }}
+          SEMVER_TAG: ${{ inputs.revision_tag }}
+        run: |
+          set -euo pipefail
+
+          : "${REVISION:?Inspect Deployment não retornou a revisão criada}"
+
+          REVISION_TAG="$(python3 <<'PY_INNER'
+          import os
+          import re
+          import sys
+
+          raw = os.environ.get("SEMVER_TAG", "").strip().lower()
+          tag = re.sub(r"[^a-z0-9-]+", "-", raw)
+          tag = re.sub(r"-{2,}", "-", tag).strip("-")
+
+          if tag and not tag[0].isalpha():
+              tag = f"v-{tag}"
+
+          tag = tag[:63].rstrip("-")
+
+          if not re.fullmatch(r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", tag):
+              print(f"Revision tag Cloud Run inválida derivada de {raw!r}: {tag!r}", file=sys.stderr)
+              raise SystemExit(1)
+
+          print(tag)
+          PY_INNER
+          )"
+
+          echo "revision_tag=${REVISION_TAG}" >> "$GITHUB_OUTPUT"
+          echo "SemVer ${SEMVER_TAG} -> revision tag ${REVISION_TAG}"
+
+          gcloud run services update-traffic "$SERVICE_NAME" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --update-tags="${REVISION_TAG}=${REVISION}" \
+            --quiet
+
+          SERVICE_FILE="$(mktemp)"
+          MAX_ATTEMPTS=30
+          DELAY_SECONDS=2
+          tag_ready="false"
+
+          for (( attempt=1; attempt<=MAX_ATTEMPTS; attempt++ )); do
+            gcloud run services describe "$SERVICE_NAME" \
+              --project="$PROJECT_ID" \
+              --region="$REGION" \
+              --platform=managed \
+              --format=json > "$SERVICE_FILE"
+
+            TAGGED_REVISION="$(SERVICE_FILE="$SERVICE_FILE" REVISION_TAG="$REVISION_TAG" python3 <<'PY_INNER'
+          import json
+          import os
+
+          with open(os.environ["SERVICE_FILE"], encoding="utf-8") as handle:
+              service = json.load(handle)
+
+          expected_tag = os.environ["REVISION_TAG"]
+          for target in service.get("status", {}).get("traffic", []):
+              if target.get("tag") == expected_tag:
+                  print(target.get("revisionName", ""))
+                  break
+          PY_INNER
+            )"
+
+            if [[ "$TAGGED_REVISION" == "$REVISION" ]]; then
+              tag_ready="true"
+              break
+            fi
+
+            echo "Aguardando revision tag ${REVISION_TAG} apontar para ${REVISION} (${attempt}/${MAX_ATTEMPTS})."
+            if (( attempt < MAX_ATTEMPTS )); then
+              sleep "$DELAY_SECONDS"
+            fi
+          done
+
+          if [[ "$tag_ready" != "true" ]]; then
+            echo "::error::Revision tag ${REVISION_TAG} não aponta para a revisão esperada ${REVISION}."
+            exit 1
+          fi
+
+          {
+            echo "### Cloud Run Revision Tag"
+            echo "- SemVer: \`${SEMVER_TAG}\`"
+            echo "- revision tag: \`${REVISION_TAG}\`"
+            echo "- revision: \`${REVISION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post-deploy HTTP Health Check ❤️‍🩹
+        if: ${{ steps.config.outputs.post_deploy_healthcheck == 'true' }}
+        env:
+          SERVICE_URL: ${{ steps.inspect.outputs.service_url }}
+          HEALTHCHECK_PATH: ${{ steps.config.outputs.healthcheck_path }}
+          HEALTHCHECK_AUTH: ${{ steps.config.outputs.healthcheck_auth }}
+          EXPECTED_STATUS: ${{ steps.config.outputs.healthcheck_expected_status }}
+          ATTEMPTS: ${{ steps.config.outputs.healthcheck_attempts }}
+          DELAY_SECONDS: ${{ steps.config.outputs.healthcheck_delay_seconds }}
+        run: |
+          set -euo pipefail
+
+          path="$HEALTHCHECK_PATH"
+          [[ "$path" == /* ]] || path="/${path}"
+          target="${SERVICE_URL%/}${path}"
+          token=""
+
+          expected_status() {
+            local status="$1"
+            local expected="$2"
+            local min max
+
+            if [[ "$expected" == *-* ]]; then
+              min="${expected%-*}"
+              max="${expected#*-}"
+              (( 10#$status >= 10#$min && 10#$status <= 10#$max ))
+            else
+              [[ "$status" == "$expected" ]]
+            fi
+          }
+
+          request_public() {
+            curl --silent --show-error \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              --max-time 30 \
+              "$target" || true
+          }
+
+          request_private() {
+            if [[ -z "$token" ]]; then
+              token="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+            fi
+
+            curl --silent --show-error \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              --max-time 30 \
+              --header="Authorization: Bearer ${token}" \
+              "$target" || true
+          }
+
+          for (( attempt=1; attempt<=ATTEMPTS; attempt++ )); do
+            status="000"
+
+            case "$HEALTHCHECK_AUTH" in
+              public)
+                status="$(request_public)"
+                ;;
+              private)
+                status="$(request_private)"
+                ;;
+              auto)
+                status="$(request_public)"
+                if ! expected_status "$status" "$EXPECTED_STATUS"; then
+                  status="$(request_private)"
+                fi
+                ;;
+            esac
+
+            if expected_status "$status" "$EXPECTED_STATUS"; then
+              echo "Health check aprovado em ${target}: HTTP ${status}"
+              exit 0
+            fi
+
+            echo "Tentativa ${attempt}/${ATTEMPTS}: HTTP ${status}; esperado ${EXPECTED_STATUS}."
+
+            if (( attempt < ATTEMPTS )); then
+              sleep "$DELAY_SECONDS"
+            fi
+          done
+
+          echo "::error::Health check falhou em ${target} após ${ATTEMPTS} tentativas."
+          exit 1
+
+      - name: Deployment Summary 📋
+        if: ${{ always() }}
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ steps.context.outputs.region }}
+          SERVICE_NAME: ${{ steps.context.outputs.service_name }}
+          IMAGE_REF: ${{ steps.context.outputs.image_ref }}
+          SERVICE_URL: ${{ steps.inspect.outputs.service_url }}
+          REVISION: ${{ steps.inspect.outputs.revision }}
+          REVISION_TAG: ${{ steps.revision_tag.outputs.revision_tag }}
+          DEPLOYED_IMAGE: ${{ steps.inspect.outputs.deployed_image }}
+          DEPLOYED_IMAGE_DIGEST: ${{ steps.inspect.outputs.deployed_image_digest }}
+          CONFIG_FILE: ${{ steps.config.outputs.config_file }}
+          JOB_STATUS: ${{ job.status }}
+          INVOKER_IAM: ${{ steps.config.outputs.invoker_iam }}
+          POST_HEALTHCHECK: ${{ steps.config.outputs.post_deploy_healthcheck }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo
+            echo "## Deploy Cloud Run"
+            echo
+            echo "| Item | Valor |"
+            echo "|---|---|"
+            echo "| Status | \`${JOB_STATUS}\` |"
+            echo "| Environment | \`${{ inputs.environment }}\` |"
+            echo "| Project | \`${PROJECT_ID:-n/a}\` |"
+            echo "| Region | \`${REGION:-n/a}\` |"
+            echo "| Service | \`${SERVICE_NAME:-n/a}\` |"
+            echo "| Revision | \`${REVISION:-n/a}\` |"
+            echo "| Revision tag | \`${REVISION_TAG:-n/a}\` |"
+            echo "| Image | \`${IMAGE_REF:-n/a}\` |"
+            echo "| Deployed image | \`${DEPLOYED_IMAGE:-n/a}\` |"
+            echo "| Deployed digest | \`${DEPLOYED_IMAGE_DIGEST:-n/a}\` |"
+            echo "| URL | ${SERVICE_URL:-n/a} |"
+            echo "| Config | \`${CONFIG_FILE:-n/a}\` |"
+            echo "| Invoker IAM | \`${INVOKER_IAM:-n/a}\` |"
+            echo "| Post health check | \`${POST_HEALTHCHECK:-n/a}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

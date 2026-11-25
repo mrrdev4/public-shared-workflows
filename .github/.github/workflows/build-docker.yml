@@ -1,0 +1,537 @@
+name: Build & Push ♻️
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        type: string
+        required: false
+        default: '["self-hosted","dev"]'
+
+      dockerfile:
+        type: string
+        required: false
+        default: "Dockerfile"
+
+      context:
+        type: string
+        required: false
+        default: "."
+
+      build_args:
+        description: List of Args to Pass to Buildah -> KEY=VALUE, one per line
+        type: string
+        required: false
+        default: ''
+
+      # ---- Destination toggles ----
+      push_to_nexus:
+        description: "Se true, faz push no Nexus"
+        type: boolean
+        required: false
+        default: true
+
+      push_to_gcp:
+        description: "Se true, faz push no GCP Artifact Registry (GAR)"
+        type: boolean
+        required: false
+        default: false
+
+      push_sha_tag:
+        description: "Se true, também publica a tag sha-<fullsha> (além da tag principal)"
+        type: boolean
+        required: false
+        default: false
+
+      # ---- Nexus ----
+      registry_repo:
+        description: "(Nexus) Namespace/pasta no registry (ex: releaseflow)."
+        type: string
+        required: false
+        default: ""
+
+      nexus_hosted:
+        type: string
+        required: false
+        default: "${{ vars.NEXUS_HOSTED }}"
+
+      insecure_registry:
+        type: boolean
+        required: false
+        default: true
+
+      # ---- GCP GAR (Docker) ----
+      gcp_registry_host:
+        description: "Host do GAR (ex: southamerica-east1-docker.pkg.dev). Vazio => vars.GCP_REGISTRY_HOST"
+        type: string
+        required: false
+        default: ""
+
+      gcp_project_id:
+        description: "Project ID do GAR. Vazio => vars.GCP_PROJECT_ID"
+        type: string
+        required: false
+        default: ""
+
+      gcp_registry_repo:
+        description: "Repositório do GAR. Vazio => vars.GCP_REGISTRY_REPO"
+        type: string
+        required: false
+        default: ""
+
+      gcp_image_name:
+        description: "Nome da imagem no GAR. Vazio => nome do repositório GitHub. Ex.: analytics-hub-dev-v1-backend"
+        type: string
+        required: false
+        default: ""
+
+      gcp_workload_identity_provider:
+        description: "WIF provider (projects/.../providers/...). Vazio => vars.GCP_WIF_PROVIDER"
+        type: string
+        required: false
+        default: ""
+
+      gcp_service_account:
+        description: "Service Account para impersonar via WIF. Vazio => vars.GCP_SERVICE_ACCOUNT"
+        type: string
+        required: false
+        default: ""
+
+    outputs:
+      # compat (aponta pro 'primário': Nexus se habilitado, senão GAR)
+      tag:
+        value: ${{ jobs.build.outputs.tag }}
+      tag_sha:
+        value: ${{ jobs.build.outputs.tag_sha }}
+      image_uri:
+        value: ${{ jobs.build.outputs.image_uri }}
+      image_path:
+        value: ${{ jobs.build.outputs.image_path }}
+      digest:
+        value: ${{ jobs.build.outputs.digest }}
+      image_by_digest:
+        value: ${{ jobs.build.outputs.image_by_digest }}
+
+      # extras
+      image_uri_nexus:
+        value: ${{ jobs.build.outputs.image_uri_nexus }}
+      image_uri_gcp:
+        value: ${{ jobs.build.outputs.image_uri_gcp }}
+      digest_nexus:
+        value: ${{ jobs.build.outputs.digest_nexus }}
+      digest_gcp:
+        value: ${{ jobs.build.outputs.digest_gcp }}
+      image_by_digest_nexus:
+        value: ${{ jobs.build.outputs.image_by_digest_nexus }}
+      image_by_digest_gcp:
+        value: ${{ jobs.build.outputs.image_by_digest_gcp }}
+      gcp_image_name:
+        value: ${{ jobs.build.outputs.gcp_image_name }}
+
+    secrets:
+      NEXUS_USER:
+        required: false
+      NEXUS_PASS:
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build & Push ♻️
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+
+    outputs:
+      tag: ${{ steps.tags.outputs.tag }}
+      tag_sha: ${{ steps.tags.outputs.tag_sha }}
+      image_uri: ${{ steps.refs.outputs.primary_image_uri }}
+      image_path: ${{ steps.refs.outputs.primary_image_path }}
+      digest: ${{ steps.final.outputs.primary_digest }}
+      image_by_digest: ${{ steps.final.outputs.primary_image_by_digest }}
+
+      image_uri_nexus: ${{ steps.refs.outputs.image_uri_nexus }}
+      image_uri_gcp: ${{ steps.refs.outputs.image_uri_gcp }}
+      digest_nexus: ${{ steps.final.outputs.digest_nexus }}
+      digest_gcp: ${{ steps.final.outputs.digest_gcp }}
+      image_by_digest_nexus: ${{ steps.final.outputs.image_by_digest_nexus }}
+      image_by_digest_gcp: ${{ steps.final.outputs.image_by_digest_gcp }}
+      gcp_image_name: ${{ steps.refs.outputs.gcp_image_name }}
+
+    steps:
+      - name: Checkout 📥
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # em PR, garante build do commit do HEAD (e não do merge commit)
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Resolve Registries 📌
+        id: refs
+        env:
+          # toggles
+          PUSH_NEXUS: ${{ inputs.push_to_nexus }}
+          PUSH_GCP: ${{ inputs.push_to_gcp }}
+
+          # from vars
+          V_NEXUS_HOSTED: ${{ vars.NEXUS_HOSTED }}
+
+          V_NEXUS_REPO: ${{ inputs.registry_repo }}
+
+          # secrets (validar quando push_to_nexus=true)
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+
+          V_GCP_REGISTRY_HOST: ${{ vars.GCP_REGISTRY_HOST }}
+          V_GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          V_GCP_REGISTRY_REPO: ${{ vars.GCP_REGISTRY_REPO }}
+          INPUT_GCP_IMAGE_NAME: ${{ inputs.gcp_image_name }}
+          V_GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          V_GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${PUSH_NEXUS}" != "true" && "${PUSH_GCP}" != "true" ]]; then
+            echo "❌ Você precisa habilitar ao menos um destino: inputs.push_to_nexus=true ou inputs.push_to_gcp=true"
+            exit 1
+          fi
+
+          APP="${GITHUB_REPOSITORY##*/}"
+          echo "app=${APP}" >> "$GITHUB_OUTPUT"
+
+          # ---------- Nexus ----------
+          # Aceita host puro (ex: registry.example.com)
+          # ou host com prefixo/path (ex: registry.example.com/docker-hosted/releaseflow)
+          NEXUS_REG_RAW="${{ inputs.nexus_hosted }}"
+          [[ -z "${NEXUS_REG_RAW}" ]] && NEXUS_REG_RAW="${V_NEXUS_HOSTED}"
+
+          # remove scheme se vier (http:// / https://)
+          NEXUS_REG_RAW="${NEXUS_REG_RAW#http://}"
+          NEXUS_REG_RAW="${NEXUS_REG_RAW#https://}"
+
+          NEXUS_REG_HOST="${NEXUS_REG_RAW%%/*}"  # host[:port]
+          NEXUS_PREFIX=""                         # path opcional
+          if [[ "${NEXUS_REG_RAW}" == */* ]]; then
+            NEXUS_PREFIX="${NEXUS_REG_RAW#*/}"
+          fi
+
+          NEXUS_REPO="${{ inputs.registry_repo }}"
+          [[ -z "${NEXUS_REPO}" ]] && NEXUS_REPO="${V_NEXUS_REPO}"
+
+          if [[ "${PUSH_NEXUS}" == "true" ]]; then
+            : "${NEXUS_REG_HOST:?Defina inputs.nexus_hosted ou vars.NEXUS_HOSTED (push_to_nexus=true)}"
+            : "${NEXUS_USER:?Defina secrets.NEXUS_USER (push_to_nexus=true)}"
+            : "${NEXUS_PASS:?Defina secrets.NEXUS_PASS (push_to_nexus=true)}"
+          fi
+
+          # Monta o path final aceitando:
+          # - host + prefix + repo + app
+          # - host + prefix + app (quando repo não for necessário)
+          # - host + repo + app (sem prefix)
+          # - (inválido) host sem prefix e sem repo
+          if [[ -n "${NEXUS_PREFIX}" && -n "${NEXUS_REPO}" ]]; then
+            IMAGE_PATH_NEXUS="${NEXUS_PREFIX}/${NEXUS_REPO}/${APP}"
+          elif [[ -n "${NEXUS_PREFIX}" ]]; then
+            IMAGE_PATH_NEXUS="${NEXUS_PREFIX}/${APP}"
+          elif [[ -n "${NEXUS_REPO}" ]]; then
+            IMAGE_PATH_NEXUS="${NEXUS_REPO}/${APP}"
+          else
+            if [[ "${PUSH_NEXUS}" == "true" ]]; then
+              echo "❌ Defina inputs.registry_repo (ex: releaseflow), OU inclua um path em inputs.nexus_hosted/vars.NEXUS_HOSTED (ex: host/docker-hosted/releaseflow)."
+              exit 1
+            fi
+            IMAGE_PATH_NEXUS=""
+          fi
+          IMAGE_URI_NEXUS="${NEXUS_REG_HOST}/${IMAGE_PATH_NEXUS}"
+
+          # 'registry' para push-to-registry deve ser somente host (sem path)
+          echo "nexus_registry=${NEXUS_REG_HOST}" >> "$GITHUB_OUTPUT"
+          echo "image_path_nexus=${IMAGE_PATH_NEXUS}" >> "$GITHUB_OUTPUT"
+          echo "image_uri_nexus=${IMAGE_URI_NEXUS}" >> "$GITHUB_OUTPUT"
+
+          # ---------- GCP GAR ----------
+          GCP_HOST="${{ inputs.gcp_registry_host }}"
+          [[ -z "${GCP_HOST}" ]] && GCP_HOST="${V_GCP_REGISTRY_HOST}"
+          [[ -z "${GCP_HOST}" ]] && GCP_HOST="southamerica-east1-docker.pkg.dev"
+
+          GCP_PROJECT="${{ inputs.gcp_project_id }}"
+          [[ -z "${GCP_PROJECT}" ]] && GCP_PROJECT="${V_GCP_PROJECT_ID}"
+
+          GCP_REPO="${{ inputs.gcp_registry_repo }}"
+          [[ -z "${GCP_REPO}" ]] && GCP_REPO="${V_GCP_REGISTRY_REPO}"
+
+          WIF_PROVIDER="${{ inputs.gcp_workload_identity_provider }}"
+          [[ -z "${WIF_PROVIDER}" ]] && WIF_PROVIDER="${V_GCP_WIF_PROVIDER}"
+
+          GCP_SA="${{ inputs.gcp_service_account }}"
+          [[ -z "${GCP_SA}" ]] && GCP_SA="${V_GCP_SERVICE_ACCOUNT}"
+
+          if [[ "${PUSH_GCP}" == "true" ]]; then
+            : "${GCP_PROJECT:?Defina inputs.gcp_project_id ou vars.GCP_PROJECT_ID (push_to_gcp=true)}"
+            : "${GCP_REPO:?Defina inputs.gcp_registry_repo ou vars.GCP_REGISTRY_REPO (push_to_gcp=true)}"
+            : "${WIF_PROVIDER:?Defina inputs.gcp_workload_identity_provider ou vars.GCP_WIF_PROVIDER (push_to_gcp=true)}"
+            : "${GCP_SA:?Defina inputs.gcp_service_account ou vars.GCP_SERVICE_ACCOUNT (push_to_gcp=true)}"
+          fi
+
+          GCP_IMAGE_NAME="${INPUT_GCP_IMAGE_NAME:-${APP}}"
+
+          # Docker/GAR image path precisa estar em lowercase e usar apenas caracteres válidos.
+          # Ex.: enterprise-integration-privado-api-analytics-hub-dev-v1-backend -> analytics-hub-dev-v1-backend
+          GCP_IMAGE_NAME="$(printf '%s' "${GCP_IMAGE_NAME}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's#[^a-z0-9._/-]+#-#g; s#(^/+|/+$)##g; s#/{2,}#/#g')"
+
+          if [[ -z "${GCP_IMAGE_NAME}" ]]; then
+            echo "❌ gcp_image_name ficou vazio após sanitização."
+            exit 1
+          fi
+
+          if [[ ! "${GCP_IMAGE_NAME}" =~ ^[a-z0-9]+([._/-]?[a-z0-9]+)*$ ]]; then
+            echo "❌ gcp_image_name inválido após sanitização: ${GCP_IMAGE_NAME}"
+            echo "   Use apenas lowercase, números, ponto, underline, hífen e barra."
+            exit 1
+          fi
+
+          IMAGE_PATH_GCP="${GCP_PROJECT}/${GCP_REPO}/${GCP_IMAGE_NAME}"
+          IMAGE_URI_GCP="${GCP_HOST}/${IMAGE_PATH_GCP}"
+
+          echo "gcp_image_name=${GCP_IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "gcp_registry_host=${GCP_HOST}" >> "$GITHUB_OUTPUT"
+          echo "gcp_project_id=${GCP_PROJECT}" >> "$GITHUB_OUTPUT"
+          echo "gcp_registry_repo=${GCP_REPO}" >> "$GITHUB_OUTPUT"
+          echo "gcp_wif_provider=${WIF_PROVIDER}" >> "$GITHUB_OUTPUT"
+          echo "gcp_service_account=${GCP_SA}" >> "$GITHUB_OUTPUT"
+          echo "image_path_gcp=${IMAGE_PATH_GCP}" >> "$GITHUB_OUTPUT"
+          echo "image_uri_gcp=${IMAGE_URI_GCP}" >> "$GITHUB_OUTPUT"
+
+          # ---------- Primary / Build image ----------
+          if [[ "${PUSH_NEXUS}" == "true" ]]; then
+            PRIMARY_IMAGE_PATH="${IMAGE_PATH_NEXUS}"
+            PRIMARY_IMAGE_URI="${IMAGE_URI_NEXUS}"
+          else
+            PRIMARY_IMAGE_PATH="${IMAGE_PATH_GCP}"
+            PRIMARY_IMAGE_URI="${IMAGE_URI_GCP}"
+          fi
+
+          echo "primary_image_path=${PRIMARY_IMAGE_PATH}" >> "$GITHUB_OUTPUT"
+          echo "primary_image_uri=${PRIMARY_IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute Tags 🏷️
+        id: tags
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          HEAD_REF: ${{ github.head_ref }}
+
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+          PUSH_SHA_TAG: ${{ inputs.push_sha_tag }}
+        run: |
+          set -euo pipefail
+
+          TAG=""
+          TAG_SHA=""
+          SHA=""
+
+          if [[ "${EVENT}" == "pull_request" ]]; then
+            BR="${HEAD_REF}"
+            SHA="${PR_HEAD_SHA}"
+            SHA7="${SHA:0:7}"
+
+            if [[ "${BR}" =~ ^(feature|bugfix|hotfix)/ ]]; then
+              # pedido: PR_NUM-GITHUB_SHA::7-rc
+              TAG="pr-${PR_NUM}-${SHA7}-rc"
+            else
+              DATE="$(date -u +%d-%m-%Y)"
+              TAG="pr-${PR_NUM}-${DATE}-${SHA7}"
+            fi
+
+            TAG_SHA="sha-${SHA}"
+          else
+            BR="${REF_NAME}"
+            SHA="${GITHUB_SHA}"
+            SHA7="${SHA:0:7}"
+
+            if [[ "${BR}" =~ ^(feature|bugfix|hotfix)/ ]]; then
+              # pedido: push nessas branches => SHA7 puro
+              TAG="${SHA7}"
+            else
+              DATE="$(date -u +%d-%m-%Y)"
+              BR_SAFE="${BR//\//-}"
+              BR_SAFE="${BR_SAFE,,}"
+              TAG="${DATE}-${SHA7}-${BR_SAFE}"
+            fi
+
+            TAG_SHA="sha-${SHA}"
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag_sha=${TAG_SHA}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "tags<<EOF"
+            echo "${TAG}"
+            if [[ "${PUSH_SHA_TAG}" == "true" ]]; then
+              echo "${TAG_SHA}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build Image 🛠️
+        uses: redhat-actions/buildah-build@v3
+        with:
+          image: ${{ steps.refs.outputs.primary_image_path }}
+          tags: ${{ steps.tags.outputs.tags }}
+          containerfiles: ${{ inputs.dockerfile }}
+          context: ${{ inputs.context }}
+          oci: true
+          layers: true
+          build-args: |
+            ${{ inputs.build_args }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.tags.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.tag }}
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.authors=${{ github.actor }}
+            org.opencontainers.image.ref.name=${{ github.ref_name }}
+
+      - name: Retag For Other Registries 🔖
+        # Só precisa retag quando ambos destinos estiverem habilitados
+        if: ${{ inputs.push_to_nexus && inputs.push_to_gcp }}
+        env:
+          BUILD_IMAGE: ${{ steps.refs.outputs.primary_image_path }}
+          NEXUS_IMAGE: ${{ steps.refs.outputs.image_path_nexus }}
+          GCP_IMAGE: ${{ steps.refs.outputs.image_path_gcp }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+          PUSH_NEXUS: ${{ inputs.push_to_nexus }}
+          PUSH_GCP: ${{ inputs.push_to_gcp }}
+        run: |
+          set -euo pipefail
+
+          # cria tags para ambos os destinos, caso o build tenha sido feito só em um "path"
+          while IFS= read -r t; do
+            t="${t//$'\r'/}"
+            t="${t## }"; t="${t%% }"
+            [[ -z "$t" ]] && continue
+
+            if [[ "${PUSH_NEXUS}" == "true" && "${BUILD_IMAGE}" != "${NEXUS_IMAGE}" ]]; then
+              buildah tag "${BUILD_IMAGE}:${t}" "${NEXUS_IMAGE}:${t}"
+            fi
+
+            if [[ "${PUSH_GCP}" == "true" && "${BUILD_IMAGE}" != "${GCP_IMAGE}" ]]; then
+              buildah tag "${BUILD_IMAGE}:${t}" "${GCP_IMAGE}:${t}"
+            fi
+          done <<< "${TAGS}"
+
+      - name: Push to Nexus ♻️
+        id: push_nexus
+        if: ${{ inputs.push_to_nexus }}
+        uses: redhat-actions/push-to-registry@v3
+        with:
+          image: ${{ steps.refs.outputs.image_path_nexus }}
+          tags: ${{ steps.tags.outputs.tags }}
+          registry: ${{ steps.refs.outputs.nexus_registry }}
+          username: ${{ secrets.NEXUS_USER }}
+          password: ${{ secrets.NEXUS_PASS }}
+          tls-verify: ${{ inputs.insecure_registry == false }}
+
+      - name: Auth to Google Cloud
+        id: gcp_auth
+        if: ${{ inputs.push_to_gcp }}
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ steps.refs.outputs.gcp_wif_provider }}
+          service_account: ${{ steps.refs.outputs.gcp_service_account }}
+          token_format: access_token
+
+      - name: Push to GCP Artifact Registry ♻️
+        id: push_gcp
+        if: ${{ inputs.push_to_gcp }}
+        uses: redhat-actions/push-to-registry@v3
+        with:
+          image: ${{ steps.refs.outputs.image_path_gcp }}
+          tags: ${{ steps.tags.outputs.tags }}
+          registry: ${{ steps.refs.outputs.gcp_registry_host }}
+          username: oauth2accesstoken
+          password: ${{ steps.gcp_auth.outputs.access_token }}
+          tls-verify: true
+
+      - name: Set Outputs 📝
+        id: final
+        env:
+          PUSH_NEXUS: ${{ inputs.push_to_nexus }}
+          PRIMARY_URI: ${{ steps.refs.outputs.primary_image_uri }}
+          DIGEST_NEXUS: ${{ steps.push_nexus.outputs.digest }}
+          DIGEST_GCP: ${{ steps.push_gcp.outputs.digest }}
+          URI_NEXUS: ${{ steps.refs.outputs.image_uri_nexus }}
+          URI_GCP: ${{ steps.refs.outputs.image_uri_gcp }}
+        run: |
+          set -euo pipefail
+
+          echo "digest_nexus=${DIGEST_NEXUS}" >> "$GITHUB_OUTPUT"
+          echo "digest_gcp=${DIGEST_GCP}" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "${DIGEST_NEXUS}" ]]; then
+            echo "image_by_digest_nexus=${URI_NEXUS}@${DIGEST_NEXUS}" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ -n "${DIGEST_GCP}" ]]; then
+            echo "image_by_digest_gcp=${URI_GCP}@${DIGEST_GCP}" >> "$GITHUB_OUTPUT"
+          fi
+
+          # compat: primário (Nexus se habilitado, senão GAR)
+          if [[ "${PUSH_NEXUS}" == "true" ]]; then
+            PRIMARY_DIGEST="${DIGEST_NEXUS}"
+          else
+            PRIMARY_DIGEST="${DIGEST_GCP}"
+          fi
+
+          echo "primary_digest=${PRIMARY_DIGEST}" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "${PRIMARY_DIGEST}" ]]; then
+            echo "primary_image_by_digest=${PRIMARY_URI}@${PRIMARY_DIGEST}" >> "$GITHUB_OUTPUT"
+          else
+            echo "primary_image_by_digest=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary 📜
+        if: ${{ always() }}
+        env:
+          TAG: ${{ steps.tags.outputs.tag }}
+          TAG_SHA: ${{ steps.tags.outputs.tag_sha }}
+          URI_NEXUS: ${{ steps.refs.outputs.image_uri_nexus }}
+          URI_GCP: ${{ steps.refs.outputs.image_uri_gcp }}
+          DIGEST_NEXUS: ${{ steps.push_nexus.outputs.digest }}
+          DIGEST_GCP: ${{ steps.push_gcp.outputs.digest }}
+          PUSH_NEXUS: ${{ inputs.push_to_nexus }}
+          PUSH_GCP: ${{ inputs.push_to_gcp }}
+        run: |
+          {
+            echo "## Build & Push ♻️ - Summary"
+            echo ""
+            echo "- tag principal: \`${TAG}\`"
+            echo "- tag sha (opcional): \`${TAG_SHA}\`"
+            echo ""
+            if [[ "${PUSH_NEXUS}" == "true" ]]; then
+              echo "### Nexus"
+              echo "- image: \`${URI_NEXUS}\`"
+              echo "- digest: \`${DIGEST_NEXUS}\`"
+              if [[ -n "${DIGEST_NEXUS}" ]]; then
+                echo "- by digest: \`${URI_NEXUS}@${DIGEST_NEXUS}\`"
+              fi
+              echo ""
+            fi
+            if [[ "${PUSH_GCP}" == "true" ]]; then
+              echo "### GCP Artifact Registry"
+              echo "- image: \`${URI_GCP}\`"
+              echo "- digest: \`${DIGEST_GCP}\`"
+              if [[ -n "${DIGEST_GCP}" ]]; then
+                echo "- by digest: \`${URI_GCP}@${DIGEST_GCP}\`"
+              fi
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
