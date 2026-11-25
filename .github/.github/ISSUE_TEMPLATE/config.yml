@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: 💬 Discussão técnica
-    url: https://github.com/V-tal/${{ARTIFACT_ID}}/discussions
+    url: https://github.com/mrrdev4/${{ARTIFACT_ID}}/discussions
     about: Use discussões para brainstorm ou dúvidas antes de abrir uma issue

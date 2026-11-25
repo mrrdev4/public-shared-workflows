@@ -398,7 +398,7 @@ jobs:
         needs.ctx.outputs.is_dev_flow == 'true' &&
         needs.ctx.result == 'success'
       }}
-    uses: V-tal/shared-workflows/.github/workflows/build-docker.yml@main
+    uses: mrrdev4/shared-workflows/.github/workflows/build-docker.yml@main
     with:
       runs_on: ${{ inputs.runs_on }}
       dockerfile: ${{ inputs.dockerfile }}
@@ -595,7 +595,7 @@ jobs:
         needs.resolve_digest.result == 'success' &&
         needs.resolve_digest.outputs.image_by_digest != ''
       }}
-    uses: V-tal/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main
+    uses: mrrdev4/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main
     with:
       runs_on: ${{ inputs.runs_on }}
       environment: Ti
@@ -634,7 +634,7 @@ jobs:
           needs.deploy_ti.result == 'success'
         )
       }}
-    uses: V-tal/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main
+    uses: mrrdev4/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main
     with:
       runs_on: ${{ inputs.runs_on }}
       environment: Trg
@@ -890,7 +890,7 @@ jobs:
         needs.retag_release_image.result == 'success' &&
         needs.retag_release_image.outputs.image_ref != ''
       }}
-    uses: V-tal/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main
+    uses: mrrdev4/shared-workflows/.github/workflows/deploy-helm-openshift.yml@main
     with:
       runs_on: ${{ inputs.runs_on }}
       environment: Prd
