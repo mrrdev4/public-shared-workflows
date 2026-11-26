@@ -1,0 +1,1548 @@
+name: Validate Cloud Run Deploy 🔎
+
+# Preflight: NÃO faz deploy, NÃO altera tráfego, NÃO altera IAM.
+# Valida configuração, identidade, permissões, serviço, dependências e o acesso à imagem
+# (Artifact Registry em outro projeto / outra região) antes de um deploy real.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'Runner labels em JSON. Ex.: ["self-hosted","dev"]'
+        required: false
+        type: string
+        default: '["self-hosted","dev"]'
+
+      environment:
+        description: "GitHub Environment usado pelo job (Dev, HML, PRD)"
+        required: false
+        type: string
+        default: Dev
+
+      config_file:
+        description: "Arquivo YAML obrigatório da aplicação. Ex.: .cloudrun/dev.yaml, .cloudrun/hml.yaml ou .cloudrun/prd.yaml"
+        required: true
+        type: string
+
+      project_id:
+        description: "Project ID do Cloud Run. Vazio => vars.GCP_CLOUDRUN_PROJECT_ID"
+        required: false
+        type: string
+        default: ""
+
+      region:
+        description: "Região do Cloud Run. Vazio => vars.GCP_REGION_REPO ou us-central1"
+        required: false
+        type: string
+        default: ""
+
+      service_name:
+        description: "Nome do serviço. Se vazio, usa o nome do repositório sanitizado"
+        required: false
+        type: string
+        default: ""
+
+      image_ref:
+        description: "Imagem completa do GAR (outro projeto/região), preferencialmente por digest: host/projeto/repo/app@sha256:..."
+        required: true
+        type: string
+
+      expected_image_digest:
+        description: "Digest esperado da imagem. Usado para validar tag SemVer em PRD. Ex.: sha256:<64 hex>"
+        required: false
+        type: string
+        default: ""
+
+      require_image_digest:
+        description: "Exigir imagem imutável no formato @sha256:<64 hex>"
+        required: false
+        type: boolean
+        default: true
+
+      revision_tag:
+        description: "Revision tag opcional (PRD). Informe o SemVer (ex.: v1.2.3); a validação mostra o valor sanitizado (v1-2-3)"
+        required: false
+        type: string
+        default: ""
+
+      registry_host:
+        description: "Host esperado do GAR. Vazio => vars.GCP_REGISTRY_HOST (se existir). Valida que image_ref vem deste host"
+        required: false
+        type: string
+        default: ""
+
+      registry_project_id:
+        description: "Projeto esperado do GAR. Vazio => vars.GCP_REGISTRY_PROJECT_ID (se existir). Valida que image_ref vem deste projeto"
+        required: false
+        type: string
+        default: ""
+
+      gcp_workload_identity_provider:
+        description: "Provider WIF do projeto Cloud Run. Vazio => vars.GCP_WIF_PROVIDER_REPO"
+        required: false
+        type: string
+        default: ""
+
+      gcp_deploy_service_account:
+        description: "Service Account de deploy. Vazio => vars.GCP_DEPLOY_SERVICE_ACCOUNT ou vars.GCP_SERVICE_ACCOUNT"
+        required: false
+        type: string
+        default: ""
+
+      runtime_service_account:
+        description: "Service Account da revisão. Vazio => vars.GCP_RUNTIME_SERVICE_ACCOUNT; se ainda vazio, SA atual do serviço ou default compute"
+        required: false
+        type: string
+        default: ""
+
+      require_deployer_image_read:
+        description: "Falhar (em vez de avisar) se a SA de deploy não conseguir ler o manifest da imagem. O pull real é feito pelo Cloud Run Service Agent"
+        required: false
+        type: boolean
+        default: false
+
+      strict_service_agent_check:
+        description: "Falhar (em vez de avisar) quando for comprovado que o Cloud Run Service Agent não tem leitura no GAR"
+        required: false
+        type: boolean
+        default: true
+
+      allow_missing_service:
+        description: "Permitir que o serviço ainda não exista (primeiro deploy)"
+        required: false
+        type: boolean
+        default: true
+
+      gcloud_version:
+        description: "Versão do Google Cloud SDK"
+        required: false
+        type: string
+        default: latest
+
+      timeout_job:
+        description: "Timeout do job em minutos"
+        required: false
+        type: number
+        default: 30
+
+    outputs:
+      project_id:
+        description: "Project ID do Cloud Run efetivamente utilizado"
+        value: ${{ jobs.preflight.outputs.project_id }}
+      region:
+        description: "Região do Cloud Run efetivamente utilizada"
+        value: ${{ jobs.preflight.outputs.region }}
+      service_name:
+        description: "Nome final do serviço Cloud Run"
+        value: ${{ jobs.preflight.outputs.service_name }}
+      service_exists:
+        description: "true/false/unknown: o serviço já existe no projeto/região"
+        value: ${{ jobs.preflight.outputs.service_exists }}
+      service_url:
+        description: "URL ATUAL do serviço (vazio se ainda não existe). Nada foi implantado"
+        value: ${{ jobs.preflight.outputs.service_url }}
+      revision:
+        description: "Revisão ATUAL pronta do serviço (vazio se não existe). Nada foi implantado"
+        value: ${{ jobs.preflight.outputs.revision }}
+      revision_tag:
+        description: "Revision tag que SERIA aplicada em PRD (sanitizada)"
+        value: ${{ jobs.preflight.outputs.revision_tag }}
+      image_ref:
+        description: "Imagem validada"
+        value: ${{ jobs.preflight.outputs.image_ref }}
+      deployed_image_digest:
+        description: "Digest resolvido no registry para image_ref (o que seria implantado)"
+        value: ${{ jobs.preflight.outputs.deployed_image_digest }}
+      config_file:
+        description: "Arquivo de configuração efetivamente utilizado"
+        value: ${{ jobs.preflight.outputs.config_file }}
+      labels:
+        description: "Labels finais que seriam aplicadas ao serviço/revisão"
+        value: ${{ jobs.preflight.outputs.labels }}
+      result:
+        description: "passed ou failed"
+        value: ${{ jobs.preflight.outputs.result }}
+      checks_failed:
+        description: "Quantidade de checks com FAIL"
+        value: ${{ jobs.preflight.outputs.checks_failed }}
+      checks_warned:
+        description: "Quantidade de checks com WARN"
+        value: ${{ jobs.preflight.outputs.checks_warned }}
+
+permissions:
+  contents: read
+  id-token: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  preflight:
+    name: Validate Cloud Run ${{ inputs.environment }} 🔎
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    timeout-minutes: ${{ inputs.timeout_job }}
+
+    environment:
+      name: ${{ inputs.environment }}
+
+    concurrency:
+      group: cloud-run-validate-${{ github.repository }}-${{ inputs.environment }}-${{ inputs.project_id || vars.GCP_CLOUDRUN_PROJECT_ID }}-${{ inputs.region || vars.GCP_REGION_REPO || 'us-central1' }}-${{ inputs.service_name || github.event.repository.name }}
+      cancel-in-progress: true
+
+    outputs:
+      project_id: ${{ steps.context.outputs.project_id }}
+      region: ${{ steps.context.outputs.region }}
+      service_name: ${{ steps.context.outputs.service_name }}
+      service_exists: ${{ steps.service.outputs.exists }}
+      service_url: ${{ steps.service.outputs.url }}
+      revision: ${{ steps.service.outputs.latest_ready }}
+      revision_tag: ${{ steps.revision_tag.outputs.revision_tag }}
+      image_ref: ${{ steps.context.outputs.image_ref }}
+      deployed_image_digest: ${{ steps.image.outputs.digest }}
+      config_file: ${{ steps.config.outputs.config_file }}
+      labels: ${{ steps.config.outputs.labels }}
+      result: ${{ steps.result.outputs.result }}
+      checks_failed: ${{ steps.result.outputs.checks_failed }}
+      checks_warned: ${{ steps.result.outputs.checks_warned }}
+
+    steps:
+      - name: Checkout Application Repository 📥
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Resolve Context 🧠
+        id: context
+        env:
+          INPUT_PROJECT_ID: ${{ inputs.project_id }}
+          INPUT_REGION: ${{ inputs.region }}
+          INPUT_SERVICE_NAME: ${{ inputs.service_name }}
+          INPUT_IMAGE_REF: ${{ inputs.image_ref }}
+          INPUT_WIF_PROVIDER: ${{ inputs.gcp_workload_identity_provider }}
+          INPUT_DEPLOY_SA: ${{ inputs.gcp_deploy_service_account }}
+          INPUT_RUNTIME_SA: ${{ inputs.runtime_service_account }}
+          INPUT_REGISTRY_HOST: ${{ inputs.registry_host }}
+          INPUT_REGISTRY_PROJECT_ID: ${{ inputs.registry_project_id }}
+          INPUT_EXPECTED_DIGEST: ${{ inputs.expected_image_digest }}
+          VAR_PROJECT_ID: ${{ vars.GCP_CLOUDRUN_PROJECT_ID }}
+          VAR_REGION: ${{ vars.GCP_REGION_REPO }}
+          VAR_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER_REPO }}
+          VAR_DEPLOY_SA: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          VAR_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          VAR_RUNTIME_SA: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
+          VAR_REGISTRY_HOST: ${{ vars.GCP_REGISTRY_HOST }}
+          VAR_REGISTRY_PROJECT_ID: ${{ vars.GCP_REGISTRY_PROJECT_ID }}
+          REQUIRE_DIGEST: ${{ inputs.require_image_digest }}
+          ENVIRONMENT_NAME: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+
+          # ---- biblioteca compartilhada entre os steps (registro de resultados) ----
+          : > "${RUNNER_TEMP}/preflight-results.tsv"
+
+          cat > "${RUNNER_TEMP}/preflight-lib.sh" <<'LIB'
+          RESULTS_FILE="${RUNNER_TEMP}/preflight-results.tsv"
+
+          record() {
+            local status="$1" check="$2" detail="${3:-}"
+            detail="${detail//$'\n'/ }"
+            detail="${detail//|/¦}"
+            printf '%s|%s|%s\n' "$status" "$check" "$detail" >> "$RESULTS_FILE"
+            case "$status" in
+              PASS) echo "✅ ${check}: ${detail}" ;;
+              INFO) echo "ℹ️  ${check}: ${detail}" ;;
+              WARN) echo "::warning title=${check}::${detail}" ;;
+              FAIL) echo "::error title=${check}::${detail}" ;;
+            esac
+          }
+
+          api_error() {
+            python3 - "$1" <<'PY'
+          import json
+          import sys
+
+          raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          try:
+              data = json.loads(raw)
+              msg = (data.get("error") or {}).get("message") or raw
+          except Exception:
+              msg = raw
+          print(" ".join(str(msg).split())[:300])
+          PY
+          }
+
+          is_not_found() {
+            grep -qiE 'not found|NOT_FOUND|cannot find|does not exist|HTTP 404' "$1"
+          }
+
+          err_text() {
+            tr '\n' ' ' < "$1" | cut -c1-300
+          }
+
+          # test_permissions <url> <perm>...
+          # Preenche GRANTED e MISSING. Retorna 0 se a API respondeu 200; 1 caso contrário (ERR_MSG).
+          test_permissions() {
+            local url="$1"; shift
+            local body out http token p g found
+            GRANTED=()
+            MISSING=()
+            ERR_MSG=""
+
+            body="$(printf '%s\n' "$@" | python3 -c 'import json,sys; print(json.dumps({"permissions":[l.strip() for l in sys.stdin if l.strip()]}))')"
+            out="$(mktemp)"
+            token="$(gcloud auth print-access-token)"
+            echo "::add-mask::${token}"
+
+            http="$(curl -sS -o "$out" -w '%{http_code}' --max-time 30 -X POST \
+              -H "Authorization: Bearer ${token}" \
+              -H "Content-Type: application/json" \
+              -d "$body" "$url" || echo 000)"
+
+            if [[ "$http" != "200" ]]; then
+              ERR_MSG="HTTP ${http}: $(api_error "$out")"
+              return 1
+            fi
+
+            mapfile -t GRANTED < <(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1])).get("permissions",[])))' "$out")
+
+            for p in "$@"; do
+              found=0
+              for g in "${GRANTED[@]}"; do
+                if [[ "$g" == "$p" ]]; then found=1; fi
+              done
+              if [[ $found -eq 0 ]]; then MISSING+=("$p"); fi
+            done
+            return 0
+          }
+          LIB
+
+          source "${RUNNER_TEMP}/preflight-lib.sh"
+
+          # ---- resolução de contexto ----
+          sanitize_service_name() {
+            local value="$1"
+
+            value="$(printf '%s' "$value" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+
+            if [[ ! "$value" =~ ^[a-z] ]]; then
+              value="app-${value}"
+            fi
+
+            value="${value:0:49}"
+            value="${value%-}"
+            printf '%s' "$value"
+          }
+
+          PROJECT_ID="${INPUT_PROJECT_ID:-${VAR_PROJECT_ID:-}}"
+          REGION="${INPUT_REGION:-${VAR_REGION:-us-central1}}"
+          RAW_SERVICE_NAME="${INPUT_SERVICE_NAME:-${GITHUB_REPOSITORY##*/}}"
+          SERVICE_NAME="$(sanitize_service_name "$RAW_SERVICE_NAME")"
+          IMAGE_REF="${INPUT_IMAGE_REF}"
+          WIF_PROVIDER="${INPUT_WIF_PROVIDER:-${VAR_WIF_PROVIDER:-}}"
+          DEPLOY_SA="${INPUT_DEPLOY_SA:-${VAR_DEPLOY_SA:-${VAR_SERVICE_ACCOUNT:-}}}"
+          RUNTIME_SA="${INPUT_RUNTIME_SA:-${VAR_RUNTIME_SA:-}}"
+          EXPECTED_DIGEST="$(printf '%s' "${INPUT_EXPECTED_DIGEST:-}" | tr '[:upper:]' '[:lower:]')"
+
+          : "${PROJECT_ID:?Defina inputs.project_id ou vars.GCP_CLOUDRUN_PROJECT_ID}"
+          : "${SERVICE_NAME:?service_name ficou vazio após sanitização}"
+          : "${IMAGE_REF:?inputs.image_ref é obrigatório}"
+          : "${WIF_PROVIDER:?Defina inputs.gcp_workload_identity_provider ou vars.GCP_WIF_PROVIDER_REPO}"
+          : "${DEPLOY_SA:?Defina inputs.gcp_deploy_service_account, vars.GCP_DEPLOY_SERVICE_ACCOUNT ou vars.GCP_SERVICE_ACCOUNT}"
+
+          if [[ ! "$SERVICE_NAME" =~ ^[a-z]([a-z0-9-]{0,47}[a-z0-9])?$ ]]; then
+            echo "::error::Nome de serviço Cloud Run inválido após sanitização: ${SERVICE_NAME}"
+            exit 1
+          fi
+
+          if [[ ! "$WIF_PROVIDER" =~ ^projects/[0-9]+/locations/global/workloadIdentityPools/[^/]+/providers/[^/]+$ ]]; then
+            echo "::error::Provider WIF inválido: ${WIF_PROVIDER}"
+            exit 1
+          fi
+
+          if [[ ! "$DEPLOY_SA" =~ ^[^@[:space:]]+@[^@[:space:]]+\.iam\.gserviceaccount\.com$ ]]; then
+            echo "::error::Service Account de deploy inválida: ${DEPLOY_SA}"
+            exit 1
+          fi
+
+          if [[ -n "$RUNTIME_SA" && ! "$RUNTIME_SA" =~ ^[^@[:space:]]+@[^@[:space:]]+\.iam\.gserviceaccount\.com$ ]]; then
+            echo "::error::Runtime Service Account inválida: ${RUNTIME_SA}"
+            exit 1
+          fi
+
+          if [[ ! "$REGION" =~ ^[a-z][a-z0-9-]*[a-z0-9]$ ]]; then
+            echo "::error::Formato de região inválido: ${REGION}"
+            exit 1
+          fi
+
+          # ---- decomposição da imagem: HOST/PROJETO/REPO/NOME(@digest|:tag) ----
+          if [[ "$IMAGE_REF" =~ ^(.+)@(sha256:[a-fA-F0-9]{64})$ ]]; then
+            IMAGE_NO_REF="${BASH_REMATCH[1]}"
+            REF_KIND="digest"
+            REF_VALUE="${BASH_REMATCH[2],,}"
+          elif [[ "$IMAGE_REF" =~ ^(.+/[^/:@]+):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$ ]]; then
+            IMAGE_NO_REF="${BASH_REMATCH[1]}"
+            REF_KIND="tag"
+            REF_VALUE="${BASH_REMATCH[2]}"
+          else
+            echo "::error::image_ref deve terminar em @sha256:<64 hex> ou :<tag>. Recebido: ${IMAGE_REF}"
+            exit 1
+          fi
+
+          if [[ ! "$IMAGE_NO_REF" =~ ^([a-z0-9-]+-docker\.pkg\.dev)/([^/]+)/([^/]+)/(.+)$ ]]; then
+            echo "::error::image_ref deve ser do Artifact Registry: <região>-docker.pkg.dev/<projeto>/<repo>/<imagem>. Recebido: ${IMAGE_REF}"
+            exit 1
+          fi
+
+          IMG_HOST="${BASH_REMATCH[1]}"
+          IMG_PROJECT="${BASH_REMATCH[2]}"
+          IMG_REPO="${BASH_REMATCH[3]}"
+          IMG_NAME="${BASH_REMATCH[4]}"
+          REGISTRY_REGION="${IMG_HOST%-docker.pkg.dev}"
+
+          if [[ "$REQUIRE_DIGEST" == "true" && "$REF_KIND" != "digest" ]]; then
+            echo "::error::A promoção exige imagem imutável por digest: host/projeto/repo/imagem@sha256:<64 hex>. Recebido: ${IMAGE_REF}"
+            exit 1
+          fi
+
+          if [[ -z "$EXPECTED_DIGEST" && "$REF_KIND" == "digest" ]]; then
+            EXPECTED_DIGEST="$REF_VALUE"
+          fi
+
+          if [[ -n "$EXPECTED_DIGEST" && ! "$EXPECTED_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::expected_image_digest inválido: ${EXPECTED_DIGEST}"
+            exit 1
+          fi
+
+          if [[ "$REF_KIND" == "digest" && "$EXPECTED_DIGEST" != "$REF_VALUE" ]]; then
+            echo "::error::expected_image_digest (${EXPECTED_DIGEST}) diverge do digest de image_ref (${REF_VALUE})."
+            exit 1
+          fi
+
+          record PASS "Formato da imagem" "host=${IMG_HOST} projeto=${IMG_PROJECT} repo=${IMG_REPO} imagem=${IMG_NAME} ${REF_KIND}=${REF_VALUE}"
+
+          # ---- a imagem precisa vir do registry esperado (se informado) ----
+          EXPECTED_HOST="${INPUT_REGISTRY_HOST:-${VAR_REGISTRY_HOST:-}}"
+          EXPECTED_HOST="${EXPECTED_HOST#http://}"
+          EXPECTED_HOST="${EXPECTED_HOST#https://}"
+          EXPECTED_HOST="${EXPECTED_HOST%/}"
+          EXPECTED_REG_PROJECT="${INPUT_REGISTRY_PROJECT_ID:-${VAR_REGISTRY_PROJECT_ID:-}}"
+
+          if [[ -n "$EXPECTED_HOST" ]]; then
+            if [[ "$EXPECTED_HOST" == "$IMG_HOST" ]]; then
+              record PASS "Host do registry" "${IMG_HOST} confere com o esperado"
+            else
+              record FAIL "Host do registry" "image_ref usa ${IMG_HOST}, esperado ${EXPECTED_HOST}"
+            fi
+          else
+            record INFO "Host do registry" "nenhum host esperado configurado (GCP_REGISTRY_HOST); validação ignorada"
+          fi
+
+          if [[ -n "$EXPECTED_REG_PROJECT" ]]; then
+            if [[ "$EXPECTED_REG_PROJECT" == "$IMG_PROJECT" ]]; then
+              record PASS "Projeto do registry" "${IMG_PROJECT} confere com o esperado"
+            else
+              record FAIL "Projeto do registry" "image_ref usa o projeto ${IMG_PROJECT}, esperado ${EXPECTED_REG_PROJECT}"
+            fi
+          else
+            record INFO "Projeto do registry" "nenhum projeto esperado configurado (GCP_REGISTRY_PROJECT_ID); validação ignorada"
+          fi
+
+          if [[ "$REGISTRY_REGION" != "$REGION" ]]; then
+            record INFO "Região imagem x serviço" "imagem em ${REGISTRY_REGION}, serviço em ${REGION} (pull entre regiões: ok, com latência/egress extra)"
+          fi
+
+          if [[ "$IMG_PROJECT" == "$PROJECT_ID" ]]; then
+            record INFO "Projeto imagem x serviço" "imagem e serviço estão no mesmo projeto (${PROJECT_ID})"
+          else
+            record INFO "Projeto imagem x serviço" "pull entre projetos: ${IMG_PROJECT} -> ${PROJECT_ID}"
+          fi
+
+          {
+            echo "project_id=${PROJECT_ID}"
+            echo "region=${REGION}"
+            echo "service_name=${SERVICE_NAME}"
+            echo "image_ref=${IMAGE_REF}"
+            echo "image_host=${IMG_HOST}"
+            echo "image_project=${IMG_PROJECT}"
+            echo "image_repo=${IMG_REPO}"
+            echo "image_name=${IMG_NAME}"
+            echo "ref_kind=${REF_KIND}"
+            echo "ref_value=${REF_VALUE}"
+            echo "registry_region=${REGISTRY_REGION}"
+            echo "wif_provider=${WIF_PROVIDER}"
+            echo "deploy_service_account=${DEPLOY_SA}"
+            echo "runtime_service_account=${RUNTIME_SA}"
+            echo "expected_image_digest=${EXPECTED_DIGEST}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ensure YAML Parser 🧩
+        run: |
+          set -euo pipefail
+
+          if python3 -c 'import yaml' >/dev/null 2>&1; then
+            python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+            exit 0
+          fi
+
+          python3 -m pip install --user --disable-pip-version-check 'PyYAML>=6.0,<7'
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
+      - name: Resolve and Validate Application Configuration ⚙️
+        id: config
+        env:
+          CONFIG_FILE: ${{ inputs.config_file }}
+          ENVIRONMENT_NAME: ${{ inputs.environment }}
+          SERVICE_NAME: ${{ steps.context.outputs.service_name }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY_INNER'
+          import os
+          import re
+          import sys
+          import unicodedata
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError as exc:
+              print(f"::error::Não foi possível importar PyYAML: {exc}")
+              sys.exit(1)
+
+          config_file = os.environ.get("CONFIG_FILE", "").strip()
+          environment_name = os.environ.get("ENVIRONMENT_NAME", "").strip()
+          service_name = os.environ.get("SERVICE_NAME", "").strip()
+
+          if not config_file:
+              print("::error::config_file é obrigatório. Informe .cloudrun/<env>.yaml no caller.")
+              sys.exit(1)
+
+          path = Path(config_file)
+          if not path.is_file():
+              print(f"::error::Arquivo Cloud Run não encontrado: {config_file}")
+              sys.exit(1)
+
+          try:
+              data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+          except yaml.YAMLError as exc:
+              print(f"::error::YAML inválido em {config_file}: {exc}")
+              sys.exit(1)
+
+          if not isinstance(data, dict):
+              print("::error::A raiz do arquivo Cloud Run deve ser um objeto/mapa YAML.")
+              sys.exit(1)
+
+          required_top = {
+              "service", "network", "environment", "labels", "finops",
+              "traffic", "security", "healthcheck", "deploy",
+          }
+
+          unknown_top = sorted(set(data) - required_top)
+          missing_top = sorted(required_top - set(data))
+
+          if unknown_top:
+              print(f"::error::Chaves desconhecidas no arquivo Cloud Run: {', '.join(unknown_top)}")
+              sys.exit(1)
+
+          if missing_top:
+              print(f"::error::Seções obrigatórias ausentes no arquivo Cloud Run: {', '.join(missing_top)}")
+              sys.exit(1)
+
+          schema = {
+              "service": {
+                  "port", "cpu", "memory", "min_instances", "max_instances",
+                  "concurrency", "request_timeout", "execution_environment",
+                  "cpu_allocation", "startup_cpu_boost", "session_affinity",
+              },
+              "network": {
+                  "ingress", "vpc_connector", "network", "subnet",
+                  "network_tags", "vpc_egress", "cloud_sql_instances",
+              },
+              "environment": {
+                  "variables", "secrets", "update_strategy", "secrets_update_strategy",
+              },
+              "finops": {
+                  "enabled", "required", "cost_center", "business_unit",
+                  "product", "team", "owner", "criticality", "data_classification",
+              },
+              "traffic": {
+                  "revision_suffix", "tag", "no_traffic", "revision_traffic", "tag_traffic",
+              },
+              "security": {"invoker_iam"},
+              "healthcheck": {
+                  "deploy_enabled", "post_deploy_enabled", "path", "auth",
+                  "expected_status", "attempts", "delay_seconds",
+              },
+              "deploy": {"skip_default_labels", "extra_flags"},
+          }
+
+          def section(name):
+              value = data.get(name)
+              if not isinstance(value, dict):
+                  print(f"::error::A seção '{name}' deve ser um mapa YAML.")
+                  sys.exit(1)
+
+              unknown = sorted(set(value) - schema[name])
+              missing = sorted(schema[name] - set(value))
+
+              if unknown:
+                  print(f"::error::Chaves desconhecidas em '{name}': {', '.join(unknown)}")
+                  sys.exit(1)
+
+              if missing:
+                  print(f"::error::Chaves obrigatórias ausentes em '{name}': {', '.join(missing)}")
+                  sys.exit(1)
+
+              return value
+
+          service = section("service")
+          network = section("network")
+          environment = section("environment")
+          finops = section("finops")
+          traffic = section("traffic")
+          security = section("security")
+          healthcheck = section("healthcheck")
+          deploy_cfg = section("deploy")
+
+          labels_cfg = data.get("labels")
+          if not isinstance(labels_cfg, (dict, str)):
+              print("::error::A seção labels deve ser um mapa YAML ou uma string KEY=VALUE.")
+              sys.exit(1)
+
+          def scalar(value, name):
+              if value is None:
+                  return ""
+              if isinstance(value, bool):
+                  return "true" if value else "false"
+              if isinstance(value, (int, float)):
+                  return str(value)
+              if isinstance(value, str):
+                  return value.strip()
+
+              print(f"::error::{name} deve ser valor escalar. Recebido: {type(value).__name__}")
+              sys.exit(1)
+
+          def list_or_csv(value, name):
+              if value is None:
+                  return ""
+              if isinstance(value, list):
+                  return ",".join(str(item).strip() for item in value if str(item).strip())
+              if isinstance(value, str):
+                  return value.strip()
+
+              print(f"::error::{name} deve ser lista ou string.")
+              sys.exit(1)
+
+          def bool_text(value, name):
+              normalized = str(value).strip().lower()
+
+              if normalized in {"true", "1", "yes", "on"}:
+                  return "true"
+
+              if normalized in {"false", "0", "no", "off"}:
+                  return "false"
+
+              print(f"::error::{name} deve ser booleano. Recebido: {value!r}")
+              sys.exit(1)
+
+          def int_text(value, name, minimum=None):
+              raw = scalar(value, name)
+
+              if not re.fullmatch(r"-?[0-9]+", raw):
+                  print(f"::error::{name} deve ser número inteiro. Recebido: {value!r}")
+                  sys.exit(1)
+
+              number = int(raw)
+
+              if minimum is not None and number < minimum:
+                  print(f"::error::{name} deve ser maior ou igual a {minimum}. Recebido: {number}")
+                  sys.exit(1)
+
+              return str(number)
+
+          def pairs_to_lines(value, name, *, allow_mount_paths=False):
+              if value is None:
+                  return ""
+
+              if isinstance(value, dict):
+                  lines = []
+
+                  for key, item in value.items():
+                      key = str(key)
+                      is_env_key = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                      is_mount_path = (
+                          allow_mount_paths
+                          and re.fullmatch(r"/(?:[^/=\s]+/)*[^/=\s]+", key)
+                      )
+
+                      if not is_env_key and not is_mount_path:
+                          print(f"::error::Chave inválida em {name}: {key}")
+                          sys.exit(1)
+
+                      if isinstance(item, (dict, list)):
+                          print(f"::error::Valor de {name}.{key} deve ser escalar.")
+                          sys.exit(1)
+
+                      lines.append(f"{key}={'' if item is None else item}")
+
+                  return "\n".join(lines)
+
+              if isinstance(value, list):
+                  return "\n".join(str(item) for item in value)
+
+              if isinstance(value, str):
+                  return value.strip()
+
+              print(f"::error::{name} deve ser mapa, lista ou string.")
+              sys.exit(1)
+
+          def parse_label_string(value):
+              result = {}
+
+              if not value:
+                  return result
+
+              raw_items = []
+              for line in str(value).splitlines():
+                  raw_items.extend(part for part in line.split(",") if part.strip())
+
+              for item in raw_items:
+                  if "=" not in item:
+                      print(f"::error::Label inválida, esperado KEY=VALUE: {item}")
+                      sys.exit(1)
+
+                  key, val = item.split("=", 1)
+                  result[key.strip()] = val.strip()
+
+              return result
+
+          def label_token(value, *, key=False):
+              token = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+              token = token.lower().strip()
+              token = re.sub(r"[^a-z0-9_-]+", "-", token)
+              token = re.sub(r"[-_]{2,}", "-", token).strip("-_")
+
+              if key and token and not token[0].isalpha():
+                  token = f"label-{token}"
+
+              return token[:63].rstrip("-_")
+
+          def validate_enum(name, value, allowed):
+              if value not in allowed:
+                  print(f"::error::{name} inválido: '{value}'. Permitidos: {', '.join(repr(item) for item in allowed)}")
+                  sys.exit(1)
+
+          resolved = {
+              "port": scalar(service["port"], "service.port"),
+              "cpu": scalar(service["cpu"], "service.cpu"),
+              "memory": scalar(service["memory"], "service.memory"),
+              "min_instances": scalar(service["min_instances"], "service.min_instances"),
+              "max_instances": scalar(service["max_instances"], "service.max_instances"),
+              "concurrency": scalar(service["concurrency"], "service.concurrency"),
+              "request_timeout": scalar(service["request_timeout"], "service.request_timeout"),
+              "execution_environment": scalar(service["execution_environment"], "service.execution_environment"),
+              "cpu_allocation": scalar(service["cpu_allocation"], "service.cpu_allocation"),
+              "startup_cpu_boost": scalar(service["startup_cpu_boost"], "service.startup_cpu_boost"),
+              "session_affinity": scalar(service["session_affinity"], "service.session_affinity"),
+              "ingress": scalar(network["ingress"], "network.ingress"),
+              "vpc_connector": scalar(network["vpc_connector"], "network.vpc_connector"),
+              "network": scalar(network["network"], "network.network"),
+              "subnet": scalar(network["subnet"], "network.subnet"),
+              "network_tags": list_or_csv(network["network_tags"], "network.network_tags"),
+              "vpc_egress": scalar(network["vpc_egress"], "network.vpc_egress"),
+              "cloud_sql_instances": list_or_csv(network["cloud_sql_instances"], "network.cloud_sql_instances"),
+              "env_vars_update_strategy": scalar(environment["update_strategy"], "environment.update_strategy"),
+              "secrets_update_strategy": scalar(environment["secrets_update_strategy"], "environment.secrets_update_strategy"),
+              "revision_suffix": scalar(traffic["revision_suffix"], "traffic.revision_suffix"),
+              "traffic_tag": scalar(traffic["tag"], "traffic.tag"),
+              "revision_traffic": scalar(traffic["revision_traffic"], "traffic.revision_traffic"),
+              "tag_traffic": scalar(traffic["tag_traffic"], "traffic.tag_traffic"),
+              "invoker_iam": scalar(security["invoker_iam"], "security.invoker_iam"),
+              "healthcheck_path": scalar(healthcheck["path"], "healthcheck.path"),
+              "healthcheck_auth": scalar(healthcheck["auth"], "healthcheck.auth"),
+              "healthcheck_expected_status": scalar(healthcheck["expected_status"], "healthcheck.expected_status"),
+              "healthcheck_attempts": int_text(healthcheck["attempts"], "healthcheck.attempts", minimum=1),
+              "healthcheck_delay_seconds": int_text(healthcheck["delay_seconds"], "healthcheck.delay_seconds", minimum=0),
+              "extra_flags": scalar(deploy_cfg["extra_flags"], "deploy.extra_flags"),
+              "env_vars": pairs_to_lines(environment["variables"], "environment.variables"),
+              "secret_env_vars": pairs_to_lines(
+                  environment["secrets"],
+                  "environment.secrets",
+                  allow_mount_paths=True,
+              ),
+              "no_traffic": bool_text(traffic["no_traffic"], "traffic.no_traffic"),
+              "skip_default_labels": bool_text(deploy_cfg["skip_default_labels"], "deploy.skip_default_labels"),
+              "deploy_health_check": bool_text(healthcheck["deploy_enabled"], "healthcheck.deploy_enabled"),
+              "post_deploy_healthcheck": bool_text(healthcheck["post_deploy_enabled"], "healthcheck.post_deploy_enabled"),
+              "config_file": config_file,
+          }
+
+          validate_enum("service.execution_environment", resolved["execution_environment"], {"", "gen1", "gen2"})
+          validate_enum("network.ingress", resolved["ingress"], {"", "all", "internal", "internal-and-cloud-load-balancing"})
+          validate_enum("service.cpu_allocation", resolved["cpu_allocation"], {"preserve", "request", "always"})
+          validate_enum("service.startup_cpu_boost", resolved["startup_cpu_boost"], {"preserve", "enabled", "disabled"})
+          validate_enum("service.session_affinity", resolved["session_affinity"], {"preserve", "enabled", "disabled"})
+          validate_enum("network.vpc_egress", resolved["vpc_egress"], {"", "private-ranges-only", "all-traffic"})
+          validate_enum("environment.update_strategy", resolved["env_vars_update_strategy"], {"merge", "overwrite"})
+          validate_enum("environment.secrets_update_strategy", resolved["secrets_update_strategy"], {"merge", "overwrite"})
+          validate_enum("security.invoker_iam", resolved["invoker_iam"], {"preserve", "public", "private"})
+          validate_enum("healthcheck.auth", resolved["healthcheck_auth"], {"auto", "public", "private"})
+
+          if resolved["vpc_connector"] and resolved["network"]:
+              print("::error::network.vpc_connector é mutuamente exclusivo com network.network/network.subnet.")
+              sys.exit(1)
+
+          if resolved["subnet"] and not resolved["network"]:
+              print("::error::network.subnet exige que network.network também seja informado.")
+              sys.exit(1)
+
+          if resolved["tag_traffic"] and resolved["revision_traffic"]:
+              print("::error::traffic.tag_traffic e traffic.revision_traffic são mutuamente exclusivos.")
+              sys.exit(1)
+
+          if resolved["no_traffic"] == "true" and (resolved["tag_traffic"] or resolved["revision_traffic"]):
+              print("::error::traffic.no_traffic=true não pode ser combinado com tag_traffic ou revision_traffic.")
+              sys.exit(1)
+
+          if not re.fullmatch(r"[0-9]{3}(-[0-9]{3})?", resolved["healthcheck_expected_status"]):
+              print("::error::healthcheck.expected_status deve ser um código ou intervalo. Ex.: 200 ou 200-399.")
+              sys.exit(1)
+
+          if resolved["skip_default_labels"] == "false":
+              print("::warning::deploy.skip_default_labels=false adiciona labels padrão da action, incluindo managed-by=github-actions e commit-sha. O padrão Releaseflow recomendado é true.")
+
+          base_labels = {
+              "environment": label_token(environment_name),
+              "application": label_token(service_name),
+              "service": label_token(service_name),
+              "platform": "cloud-run",
+              "managed-by": "releaseflow",
+          }
+
+          finops_enabled = bool_text(finops["enabled"], "finops.enabled") == "true"
+          finops_required = bool_text(finops["required"], "finops.required") == "true"
+
+          finops_map = {
+              "cost-center": finops["cost_center"],
+              "business-unit": finops["business_unit"],
+              "product": finops["product"],
+              "team": finops["team"],
+              "owner": finops["owner"],
+              "criticality": finops["criticality"],
+              "data-classification": finops["data_classification"],
+          }
+
+          required_finops = ("cost-center", "business-unit", "product", "team")
+
+          if finops_enabled and finops_required:
+              missing = [key for key in required_finops if not str(finops_map.get(key, "")).strip()]
+              if missing:
+                  print(f"::error::Labels FinOps obrigatórias ausentes em {config_file}: {', '.join(missing)}")
+                  sys.exit(1)
+
+          final_labels = dict(base_labels)
+
+          if finops_enabled:
+              for key, value in finops_map.items():
+                  if str(value).strip():
+                      final_labels[key] = label_token(value)
+
+          if isinstance(labels_cfg, dict):
+              file_labels = labels_cfg
+          else:
+              file_labels = parse_label_string(labels_cfg)
+
+          protected = set(final_labels)
+
+          for raw_key, raw_value in file_labels.items():
+              key = label_token(raw_key, key=True)
+              value = label_token(raw_value)
+
+              if not key:
+                  print(f"::error::Label com chave vazia no arquivo: {raw_key!r}")
+                  sys.exit(1)
+
+              if key in protected and final_labels.get(key) != value:
+                  print(f"::error::A label governada '{key}' não pode ser sobrescrita pelo arquivo.")
+                  sys.exit(1)
+
+              final_labels[key] = value
+
+          resolved["labels"] = "\n".join(
+              f"{key}={value}" for key, value in sorted(final_labels.items())
+          )
+
+          def output(name, value):
+              value = "" if value is None else str(value)
+
+              if "\n" in value:
+                  delimiter = f"CLOUDRUN_{name.upper()}_EOF"
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+                      handle.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
+              else:
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+                      handle.write(f"{name}={value}\n")
+
+          for key, value in resolved.items():
+              output(key, value)
+
+          print(f"Configuração carregada e validada: {config_file}")
+          print("Labels finais:")
+          print(resolved["labels"])
+          PY_INNER
+
+          source "${RUNNER_TEMP}/preflight-lib.sh"
+          record PASS "Arquivo de configuração" "${CONFIG_FILE} válido (schema, enums, combinações e labels)"
+
+      - name: Preview Revision Tag 🏷️
+        id: revision_tag
+        if: ${{ inputs.environment == 'PRD' && inputs.revision_tag != '' }}
+        env:
+          SEMVER_TAG: ${{ inputs.revision_tag }}
+        run: |
+          set -euo pipefail
+          source "${RUNNER_TEMP}/preflight-lib.sh"
+
+          REVISION_TAG="$(python3 <<'PY_INNER'
+          import os
+          import re
+          import sys
+
+          raw = os.environ.get("SEMVER_TAG", "").strip().lower()
+          tag = re.sub(r"[^a-z0-9-]+", "-", raw)
+          tag = re.sub(r"-{2,}", "-", tag).strip("-")
+
+          if tag and not tag[0].isalpha():
+              tag = f"v-{tag}"
+
+          tag = tag[:63].rstrip("-")
+
+          if not re.fullmatch(r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", tag):
+              print(f"Revision tag Cloud Run inválida derivada de {raw!r}: {tag!r}", file=sys.stderr)
+              raise SystemExit(1)
+
+          print(tag)
+          PY_INNER
+          )" || { record FAIL "Revision tag" "não foi possível derivar uma revision tag válida de '${SEMVER_TAG}'"; exit 0; }
+
+          echo "revision_tag=${REVISION_TAG}" >> "$GITHUB_OUTPUT"
+          record PASS "Revision tag" "SemVer ${SEMVER_TAG} -> ${REVISION_TAG} (seria aplicada ao PRD)"
+
+      - name: Authenticate to Google Cloud 🔐
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ steps.context.outputs.project_id }}
+          workload_identity_provider: ${{ steps.context.outputs.wif_provider }}
+          service_account: ${{ steps.context.outputs.deploy_service_account }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Setup Google Cloud SDK ☁️
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ${{ inputs.gcloud_version }}
+          project_id: ${{ steps.context.outputs.project_id }}
+
+      - name: Validate Project, Identity and APIs 🔎
+        id: project
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ steps.context.outputs.region }}
+          DEPLOY_SA: ${{ steps.context.outputs.deploy_service_account }}
+          SECRETS: ${{ steps.config.outputs.secret_env_vars }}
+          CLOUD_SQL: ${{ steps.config.outputs.cloud_sql_instances }}
+          VPC_CONNECTOR: ${{ steps.config.outputs.vpc_connector }}
+        run: |
+          set -euo pipefail
+          source "${RUNNER_TEMP}/preflight-lib.sh"
+
+          ERR="$(mktemp)"
+
+          ACTIVE_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' | head -n1)"
+          if [[ -z "$ACTIVE_ACCOUNT" ]]; then
+            record FAIL "Identidade gcloud" "nenhuma identidade ativa foi encontrada (falha de autenticação WIF?)"
+            exit 1
+          fi
+
+          gcloud config set project "$PROJECT_ID" --quiet
+
+          if [[ "$ACTIVE_ACCOUNT" == "$DEPLOY_SA" ]]; then
+            record PASS "Identidade gcloud" "autenticado como ${ACTIVE_ACCOUNT} via WIF"
+          else
+            record INFO "Identidade gcloud" "conta ativa ${ACTIVE_ACCOUNT}; SA de deploy configurada ${DEPLOY_SA}"
+          fi
+
+          if PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>"$ERR")"; then
+            record PASS "Projeto Cloud Run" "${PROJECT_ID} acessível (número ${PROJECT_NUMBER})"
+          else
+            PROJECT_NUMBER=""
+            record WARN "Projeto Cloud Run" "não foi possível descrever ${PROJECT_ID}: $(err_text "$ERR") (a SA pode não ter resourcemanager.projects.get)"
+          fi
+          echo "project_number=${PROJECT_NUMBER}" >> "$GITHUB_OUTPUT"
+
+          REQUIRED_APIS="run.googleapis.com"
+          if [[ -n "$SECRETS" ]]; then REQUIRED_APIS="${REQUIRED_APIS} secretmanager.googleapis.com"; fi
+          if [[ -n "$CLOUD_SQL" ]]; then REQUIRED_APIS="${REQUIRED_APIS} sqladmin.googleapis.com"; fi
+          if [[ -n "$VPC_CONNECTOR" ]]; then REQUIRED_APIS="${REQUIRED_APIS} vpcaccess.googleapis.com"; fi
+
+          if ENABLED="$(gcloud services list --enabled --project="$PROJECT_ID" --format='value(config.name)' 2>"$ERR")"; then
+            for api in $REQUIRED_APIS; do
+              if grep -qx "$api" <<<"$ENABLED"; then
+                record PASS "API ${api}" "habilitada em ${PROJECT_ID}"
+              else
+                record FAIL "API ${api}" "NÃO habilitada em ${PROJECT_ID}"
+              fi
+            done
+          else
+            record WARN "APIs do projeto" "não foi possível listar APIs habilitadas ($(err_text "$ERR")); verifique: ${REQUIRED_APIS}"
+          fi
+
+      - name: Check Cloud Run Service State 🔍
+        id: service
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ steps.context.outputs.region }}
+          SERVICE_NAME: ${{ steps.context.outputs.service_name }}
+          ALLOW_MISSING: ${{ inputs.allow_missing_service }}
+        run: |
+          set -euo pipefail
+          source "${RUNNER_TEMP}/preflight-lib.sh"
+
+          ERR="$(mktemp)"
+          SERVICE_JSON="$(mktemp)"
+
+          if gcloud run services describe "$SERVICE_NAME" \
+              --project="$PROJECT_ID" \
+              --region="$REGION" \
+              --platform=managed \
+              --format=json > "$SERVICE_JSON" 2>"$ERR"; then
+
+            python3 - "$SERVICE_JSON" >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import sys
+
+          svc = json.load(open(sys.argv[1], encoding="utf-8"))
+          status = svc.get("status", {})
+          tpl = svc.get("spec", {}).get("template", {}).get("spec", {})
+          containers = tpl.get("containers", [])
+          ann = svc.get("metadata", {}).get("annotations", {})
+          ready = next((c.get("status", "") for c in status.get("conditions", []) if c.get("type") == "Ready"), "")
+
+          print("exists=true")
+          print("latest_ready=" + str(status.get("latestReadyRevisionName", "")))
+          print("url=" + str(status.get("url", "")))
+          print("current_sa=" + str(tpl.get("serviceAccountName", "")))
+          print("current_image=" + str(containers[0].get("image", "") if containers else ""))
+          print("current_ingress=" + str(ann.get("run.googleapis.com/ingress", "")))
+          print("ready=" + str(ready))
+          PY
+
+            CUR_READY="$(grep '^ready=' "$GITHUB_OUTPUT" | tail -n1 | cut -d= -f2-)"
+            CUR_REV="$(grep '^latest_ready=' "$GITHUB_OUTPUT" | tail -n1 | cut -d= -f2-)"
+            record PASS "Serviço Cloud Run" "${SERVICE_NAME} existe em ${REGION}; revisão atual ${CUR_REV:-n/a}"
+            if [[ "$CUR_READY" == "False" ]]; then
+              record WARN "Serviço Cloud Run" "o serviço atual NÃO está Ready; um novo deploy pode herdar o problema"
+            fi
+
+          elif is_not_found "$ERR"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            if [[ "$ALLOW_MISSING" == "true" ]]; then
+              record INFO "Serviço Cloud Run" "${SERVICE_NAME} ainda não existe em ${REGION}/${PROJECT_ID}: será criado no primeiro deploy"
+            else
+              record FAIL "Serviço Cloud Run" "${SERVICE_NAME} não existe em ${REGION}/${PROJECT_ID} e allow_missing_service=false"
+            fi
+
+          else
+            echo "exists=unknown" >> "$GITHUB_OUTPUT"
+            record WARN "Serviço Cloud Run" "não foi possível consultar ${SERVICE_NAME}: $(err_text "$ERR")"
+          fi
+
+      - name: Check Deployer Permissions 🛂
+        id: perms
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ steps.context.outputs.region }}
+          SERVICE_NAME: ${{ steps.context.outputs.service_name }}
+          DEPLOY_SA: ${{ steps.context.outputs.deploy_service_account }}
+          RUNTIME_SA: ${{ steps.context.outputs.runtime_service_account }}
+          CURRENT_SA: ${{ steps.service.outputs.current_sa }}
+          SERVICE_EXISTS: ${{ steps.service.outputs.exists }}
+          PROJECT_NUMBER: ${{ steps.project.outputs.project_number }}
+          INVOKER_IAM: ${{ steps.config.outputs.invoker_iam }}
+        run: |
+          set -euo pipefail
+          source "${RUNNER_TEMP}/preflight-lib.sh"
+
+          PROJECT_IAM_URL="https://cloudresourcemanager.googleapis.com/v1/projects/${PROJECT_ID}:testIamPermissions"
+          SERVICE_IAM_URL="https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE_NAME}:testIamPermissions"
+
+          # ---- permissões Cloud Run da SA de deploy ----
+          PERMS=(run.services.get run.operations.get)
+          if [[ "$SERVICE_EXISTS" == "true" ]]; then
+            PERMS+=(run.services.update run.revisions.get)
+          else
+            PERMS+=(run.services.create)
+          fi
+          if [[ "$INVOKER_IAM" != "preserve" ]]; then
+            PERMS+=(run.services.getIamPolicy run.services.setIamPolicy)
+          fi
+
+          if test_permissions "$PROJECT_IAM_URL" "${PERMS[@]}"; then
+            STILL=(${MISSING[@]+"${MISSING[@]}"})
+
+            # permissões de serviço podem estar concedidas só no recurso do serviço
+            if [[ "$SERVICE_EXISTS" == "true" && ${#STILL[@]} -gt 0 ]]; then
+              SVC_PERMS=()
+              for p in "${STILL[@]}"; do
+                case "$p" in
+                  run.services.get|run.services.update|run.services.getIamPolicy|run.services.setIamPolicy) SVC_PERMS+=("$p") ;;
+                esac
+              done
+
+              if [[ ${#SVC_PERMS[@]} -gt 0 ]] && test_permissions "$SERVICE_IAM_URL" "${SVC_PERMS[@]}"; then
+                NEW=()
+                for p in "${STILL[@]}"; do
+                  skip=0
+                  for g in "${GRANTED[@]}"; do
+                    if [[ "$g" == "$p" ]]; then skip=1; fi
+                  done
+                  if [[ $skip -eq 0 ]]; then NEW+=("$p"); fi
+                done
+                STILL=(${NEW[@]+"${NEW[@]}"})
+              fi
+            fi
+
+            if [[ ${#STILL[@]} -eq 0 ]]; then
+              record PASS "Permissões Cloud Run" "${DEPLOY_SA} possui: ${PERMS[*]}"
+            else
+              record FAIL "Permissões Cloud Run" "faltam para ${DEPLOY_SA} em ${PROJECT_ID}: ${STILL[*]} (sugestão: roles/run.developer; roles/run.admin se invoker_iam != preserve)"
+            fi
+          else
+            record WARN "Permissões Cloud Run" "não foi possível testar permissões (${ERR_MSG}). Verifique se a Cloud Resource Manager API está habilitada no projeto da credencial"
+          fi
+
+          # ---- SA de runtime efetiva + iam.serviceAccounts.actAs ----
+          EFFECTIVE_SA="$RUNTIME_SA"
+          SA_ORIGIN="informada"
+          if [[ -z "$EFFECTIVE_SA" && -n "$CURRENT_SA" ]]; then
+            EFFECTIVE_SA="$CURRENT_SA"
+            SA_ORIGIN="atual do serviço (preservada)"
+          fi
+          if [[ -z "$EFFECTIVE_SA" && -n "$PROJECT_NUMBER" ]]; then
+            EFFECTIVE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+            SA_ORIGIN="default compute"
+            record WARN "SA de runtime" "nenhuma SA de runtime definida (GCP_RUNTIME_SERVICE_ACCOUNT); o serviço usaria a default compute ${EFFECTIVE_SA}"
+          fi
+          echo "effective_runtime_sa=${EFFECTIVE_SA}" >> "$GITHUB_OUTPUT"
+
+          if [[ -z "$EFFECTIVE_SA" ]]; then
+            record WARN "SA de runtime" "não foi possível determinar a SA de runtime; actAs não verificado"
+          else
+            SA_IAM_URL="https://iam.googleapis.com/v1/projects/-/serviceAccounts/${EFFECTIVE_SA}:testIamPermissions"
+            if test_permissions "$SA_IAM_URL" iam.serviceAccounts.actAs; then
+              if [[ ${#MISSING[@]} -eq 0 ]]; then
+                record PASS "SA de runtime (actAs)" "${DEPLOY_SA} pode atuar como ${EFFECTIVE_SA} (${SA_ORIGIN})"
+              else
+                record FAIL "SA de runtime (actAs)" "${DEPLOY_SA} NÃO possui iam.serviceAccounts.actAs em ${EFFECTIVE_SA} (conceda roles/iam.serviceAccountUser nessa SA)"
+              fi
+            elif [[ "$ERR_MSG" == HTTP\ 404* ]]; then
+              record FAIL "SA de runtime" "${EFFECTIVE_SA} não encontrada (${SA_ORIGIN})"
+            else
+              record WARN "SA de runtime (actAs)" "não foi possível verificar actAs em ${EFFECTIVE_SA}: ${ERR_MSG}"
+            fi
+          fi
+
+      - name: Check Dependencies (Secrets, VPC, Cloud SQL) 🧱
+        env:
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ steps.context.outputs.region }}
+          EFFECTIVE_SA: ${{ steps.perms.outputs.effective_runtime_sa }}
+          SECRETS: ${{ steps.config.outputs.secret_env_vars }}
+          CLOUD_SQL: ${{ steps.config.outputs.cloud_sql_instances }}
+          VPC_CONNECTOR: ${{ steps.config.outputs.vpc_connector }}
+        run: |
+          set -euo pipefail
+          source "${RUNNER_TEMP}/preflight-lib.sh"
+
+          ERR="$(mktemp)"
+          OUT="$(mktemp)"
+
+          # ---- secrets: KEY=secret:versão  |  /mount/path=secret:versão  |  KEY=projects/P/secrets/S:versão ----
+          if [[ -z "$SECRETS" ]]; then
+            record INFO "Secrets" "nenhum secret configurado em environment.secrets"
+          else
+            while IFS= read -r line; do
+              if [[ -z "$line" ]]; then continue; fi
+
+              target="${line%%=*}"
+              ref="${line#*=}"
+
+              if [[ "$ref" != *:* ]]; then
+                record FAIL "Secret ${target}" "formato inválido (esperado NOME:VERSÃO): ${ref}"
+                continue
+              fi
+
+              version="${ref##*:}"
+              name="${ref%:*}"
+              secret_project="$PROJECT_ID"
+              if [[ "$name" =~ ^projects/([^/]+)/secrets/(.+)$ ]]; then
+                secret_project="${BASH_REMATCH[1]}"
+                name="${BASH_REMATCH[2]}"
+              fi
+
+              if gcloud secrets versions describe "$version" --secret="$name" --project="$secret_project" \
+                  --format='value(state)' > "$OUT" 2>"$ERR"; then
+                state="$(cat "$OUT")"
+                if [[ "$state" == "ENABLED" ]]; then
+                  record PASS "Secret ${name}" "versão ${version} existe e está ENABLED (${secret_project})"
+                else
+                  record FAIL "Secret ${name}" "versão ${version} em estado ${state} (${secret_project})"
+                fi
+              elif is_not_found "$ERR"; then
+                record FAIL "Secret ${name}" "secret/versão ${version} não encontrado em ${secret_project}"
+                continue
+              else
+                record WARN "Secret ${name}" "não foi possível verificar a versão ${version}: $(err_text "$ERR")"
+                continue
+              fi
+
+              # a SA de runtime precisa de roles/secretmanager.secretAccessor (o Cloud Run valida no deploy)
+              if [[ -n "$EFFECTIVE_SA" ]]; then
+                POLICY="$(gcloud secrets get-iam-policy "$name" --project="$secret_project" --format=json 2>/dev/null || true)"
+                if [[ -n "$POLICY" ]]; then
+                  HAS_ACCESS="$(POLICY="$POLICY" python3 - "$EFFECTIVE_SA" <<'PY'
+          import json
+          import os
+          import sys
+
+          sa = "serviceAccount:" + sys.argv[1]
+          roles = {
+              "roles/secretmanager.secretAccessor",
+              "roles/secretmanager.admin",
+              "roles/owner",
+          }
+          policy = json.loads(os.environ["POLICY"])
+          found = any(
+              b.get("role") in roles and sa in b.get("members", [])
+              for b in policy.get("bindings", [])
+          )
+          print("yes" if found else "no")
+          PY
+          )"
+                  if [[ "$HAS_ACCESS" == "yes" ]]; then
+                    record PASS "Acesso ao secret ${name}" "${EFFECTIVE_SA} possui secretAccessor"
+                  else
+                    record WARN "Acesso ao secret ${name}" "sem binding direto de secretAccessor para ${EFFECTIVE_SA} no secret (pode estar herdado do projeto; o deploy falha se faltar)"
+                  fi
+                else
+                  record INFO "Acesso ao secret ${name}" "policy não legível pela SA de deploy; acesso da SA de runtime não verificado"
+                fi
+              fi
+            done <<<"$SECRETS"
+          fi
+
+          # ---- VPC connector ----
+          if [[ -n "$VPC_CONNECTOR" ]]; then
+            if gcloud compute networks vpc-access connectors describe "$VPC_CONNECTOR" \
+                --region="$REGION" --project="$PROJECT_ID" --format='value(state)' > "$OUT" 2>"$ERR"; then
+              state="$(cat "$OUT")"
+              if [[ "$state" == "READY" ]]; then
+                record PASS "VPC connector" "${VPC_CONNECTOR} READY"
+              else
+                record FAIL "VPC connector" "${VPC_CONNECTOR} em estado ${state}"
+              fi
+            elif is_not_found "$ERR"; then
+              record FAIL "VPC connector" "${VPC_CONNECTOR} não encontrado em ${REGION}/${PROJECT_ID}"
+            else
+              record WARN "VPC connector" "não foi possível verificar ${VPC_CONNECTOR}: $(err_text "$ERR")"
+            fi
+          fi
+
+          # ---- Cloud SQL: project:region:instance ----
+          if [[ -n "$CLOUD_SQL" ]]; then
+            IFS=',' read -r -a SQL_LIST <<<"$CLOUD_SQL"
+            for inst in "${SQL_LIST[@]}"; do
+              IFS=':' read -r sql_project sql_region sql_name <<<"$inst"
+              if [[ -z "${sql_name:-}" ]]; then
+                record FAIL "Cloud SQL" "formato inválido (esperado projeto:região:instância): ${inst}"
+                continue
+              fi
+              if gcloud sql instances describe "$sql_name" --project="$sql_project" --format='value(state)' > "$OUT" 2>"$ERR"; then
+                record PASS "Cloud SQL ${sql_name}" "existe (estado $(cat "$OUT"))"
+              elif is_not_found "$ERR"; then
+                record FAIL "Cloud SQL ${sql_name}" "instância não encontrada em ${sql_project}"
+              else
+                record WARN "Cloud SQL ${sql_name}" "não foi possível verificar: $(err_text "$ERR")"
+              fi
+            done
+          fi
+
+      - name: Validate Image Access (Artifact Registry) 📦
+        id: image
+        env:
+          IMAGE_REF: ${{ steps.context.outputs.image_ref }}
+          IMG_HOST: ${{ steps.context.outputs.image_host }}
+          IMG_PROJECT: ${{ steps.context.outputs.image_project }}
+          IMG_REPO: ${{ steps.context.outputs.image_repo }}
+          IMG_NAME: ${{ steps.context.outputs.image_name }}
+          REF_VALUE: ${{ steps.context.outputs.ref_value }}
+          REGISTRY_REGION: ${{ steps.context.outputs.registry_region }}
+          EXPECTED_DIGEST: ${{ steps.context.outputs.expected_image_digest }}
+          DEPLOY_SA: ${{ steps.context.outputs.deploy_service_account }}
+          PROJECT_NUMBER: ${{ steps.project.outputs.project_number }}
+          REQUIRE_DEPLOYER_READ: ${{ inputs.require_deployer_image_read }}
+          STRICT_AGENT: ${{ inputs.strict_service_agent_check }}
+        run: |
+          set -euo pipefail
+          source "${RUNNER_TEMP}/preflight-lib.sh"
+
+          TOKEN="$(gcloud auth print-access-token)"
+          echo "::add-mask::${TOKEN}"
+
+          MANIFEST_FILE="$(mktemp)"
+          HEADERS_FILE="$(mktemp)"
+          BASE_URL="https://${IMG_HOST}/v2/${IMG_PROJECT}/${IMG_REPO}/${IMG_NAME}"
+          ACCEPT='application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json'
+
+          READ_LEVEL="WARN"
+          if [[ "$REQUIRE_DEPLOYER_READ" == "true" ]]; then READ_LEVEL="FAIL"; fi
+
+          # ---- 1) a SA de deploy consegue ler o manifest? (equivale a um "pull" dos metadados) ----
+          HTTP="$(curl -sS -L -o "$MANIFEST_FILE" -D "$HEADERS_FILE" -w '%{http_code}' --max-time 30 \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: ${ACCEPT}" \
+            "${BASE_URL}/manifests/${REF_VALUE}" || echo 000)"
+
+          DIGEST=""
+          case "$HTTP" in
+            200)
+              DIGEST="$(grep -i '^docker-content-digest:' "$HEADERS_FILE" | tail -n1 | awk '{print $2}' | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+              if [[ -z "$DIGEST" ]]; then
+                DIGEST="sha256:$(sha256sum "$MANIFEST_FILE" | awk '{print $1}')"
+              fi
+              record PASS "Leitura da imagem (SA de deploy)" "${DEPLOY_SA} leu o manifest de ${IMG_NAME}@${DIGEST}"
+              ;;
+            401|403)
+              record "$READ_LEVEL" "Leitura da imagem (SA de deploy)" "HTTP ${HTTP}: ${DEPLOY_SA} não lê ${IMG_REPO} em ${IMG_PROJECT}. Não é obrigatório para o pull (feito pelo Service Agent), mas impede validar digest/arquitetura. Use require_deployer_image_read=true para exigir"
+              ;;
+            404)
+              record FAIL "Imagem no registry" "não encontrada: ${IMAGE_REF} (o build/push terminou? a tag existe?)"
+              ;;
+            *)
+              record "$READ_LEVEL" "Leitura da imagem (SA de deploy)" "resposta inesperada do registry: HTTP ${HTTP}"
+              ;;
+          esac
+
+          # ---- 2) digest esperado + arquitetura ----
+          if [[ -n "$DIGEST" ]]; then
+            if [[ -n "$EXPECTED_DIGEST" ]]; then
+              if [[ "$DIGEST" == "$EXPECTED_DIGEST" ]]; then
+                record PASS "Digest da imagem" "${DIGEST} confere com o esperado"
+              else
+                record FAIL "Digest da imagem" "divergente. Esperado ${EXPECTED_DIGEST}; o registry retornou ${DIGEST} para ${REF_VALUE}"
+              fi
+            else
+              record INFO "Digest da imagem" "${DIGEST} (nenhum digest esperado informado; referência mutável)"
+            fi
+
+            KIND="$(python3 - "$MANIFEST_FILE" <<'PY'
+          import json
+          import sys
+
+          m = json.load(open(sys.argv[1], encoding="utf-8"))
+          if "manifests" in m:
+              plats = set()
+              for x in m["manifests"]:
+                  p = x.get("platform") or dict()
+                  plats.add(p.get("os", "?") + "/" + p.get("architecture", "?"))
+              print("index " + ",".join(sorted(plats)))
+          elif "config" in m:
+              print("manifest " + str((m.get("config") or dict()).get("digest", "")))
+          else:
+              print("unknown")
+          PY
+          )"
+
+            case "$KIND" in
+              index\ *)
+                PLATS="${KIND#index }"
+                if [[ ",${PLATS}," == *",linux/amd64,"* ]]; then
+                  record PASS "Plataforma da imagem" "manifest list contém linux/amd64 (${PLATS})"
+                else
+                  record FAIL "Plataforma da imagem" "Cloud Run exige linux/amd64; a imagem tem: ${PLATS}"
+                fi
+                ;;
+              manifest\ sha256:*)
+                CONFIG_DIGEST="${KIND#manifest }"
+                CONFIG_FILE_TMP="$(mktemp)"
+                CHTTP="$(curl -sS -L -o "$CONFIG_FILE_TMP" -w '%{http_code}' --max-time 30 \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  "${BASE_URL}/blobs/${CONFIG_DIGEST}" || echo 000)"
+                if [[ "$CHTTP" == "200" ]]; then
+                  PLAT="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(str(c.get("os","?"))+"/"+str(c.get("architecture","?")))' "$CONFIG_FILE_TMP" 2>/dev/null || echo '?/?')"
+                  if [[ "$PLAT" == "linux/amd64" ]]; then
+                    record PASS "Plataforma da imagem" "linux/amd64"
+                  else
+                    record FAIL "Plataforma da imagem" "Cloud Run exige linux/amd64; a imagem é ${PLAT}"
+                  fi
+                else
+                  record WARN "Plataforma da imagem" "não foi possível ler o config blob (HTTP ${CHTTP})"
+                fi
+                ;;
+              *)
+                record WARN "Plataforma da imagem" "formato de manifest não reconhecido; arquitetura não verificada"
+                ;;
+            esac
+          fi
+
+          # ---- 3) o Cloud Run Service Agent (quem realmente faz o pull) tem leitura no GAR? ----
+          if [[ -z "$PROJECT_NUMBER" ]]; then
+            record WARN "Service Agent x GAR" "número do projeto Cloud Run indisponível; não foi possível identificar o Service Agent"
+          else
+            AGENT="service-${PROJECT_NUMBER}@serverless-robot-prod.iam.gserviceaccount.com"
+
+            REPO_POLICY="$(gcloud artifacts repositories get-iam-policy "$IMG_REPO" \
+              --project="$IMG_PROJECT" --location="$REGISTRY_REGION" --format=json 2>/dev/null || true)"
+            PROJ_POLICY="$(gcloud projects get-iam-policy "$IMG_PROJECT" --format=json 2>/dev/null || true)"
+
+            AGENT_STATE="$(AGENT="$AGENT" REPO_POLICY="$REPO_POLICY" PROJ_POLICY="$PROJ_POLICY" python3 <<'PY'
+          import json
+          import os
+
+          agent = "serviceAccount:" + os.environ["AGENT"]
+          roles = {
+              "roles/artifactregistry.reader",
+              "roles/artifactregistry.writer",
+              "roles/artifactregistry.repoAdmin",
+              "roles/artifactregistry.admin",
+              "roles/owner",
+          }
+
+          readable = 0
+          found = False
+          for key in ("REPO_POLICY", "PROJ_POLICY"):
+              raw = os.environ.get(key, "").strip()
+              if not raw:
+                  continue
+              try:
+                  policy = json.loads(raw)
+              except json.JSONDecodeError:
+                  continue
+              readable += 1
+              for b in policy.get("bindings", []):
+                  if b.get("role") in roles and agent in b.get("members", []):
+                      found = True
+
+          if found:
+              print("found")
+          elif readable == 2:
+              print("missing")
+          else:
+              print("unknown")
+          PY
+          )"
+
+            GRANT_HINT="gcloud artifacts repositories add-iam-policy-binding ${IMG_REPO} --project=${IMG_PROJECT} --location=${REGISTRY_REGION} --member=serviceAccount:${AGENT} --role=roles/artifactregistry.reader"
+
+            case "$AGENT_STATE" in
+              found)
+                record PASS "Service Agent x GAR" "${AGENT} tem leitura em ${IMG_PROJECT}/${IMG_REPO}"
+                ;;
+              missing)
+                LEVEL="WARN"
+                if [[ "$STRICT_AGENT" == "true" ]]; then LEVEL="FAIL"; fi
+                record "$LEVEL" "Service Agent x GAR" "${AGENT} NÃO tem leitura em ${IMG_PROJECT}/${IMG_REPO}; o deploy falharia no pull. Conceda: ${GRANT_HINT}"
+                ;;
+              *)
+                record WARN "Service Agent x GAR" "não foi possível ler as policies do registry com a SA de deploy; confirme manualmente que ${AGENT} tem roles/artifactregistry.reader. Ex.: ${GRANT_HINT}"
+                ;;
+            esac
+          fi
+
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Preflight Result 📋
+        id: result
+        if: ${{ always() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          ENVIRONMENT_NAME: ${{ inputs.environment }}
+          PROJECT_ID: ${{ steps.context.outputs.project_id }}
+          REGION: ${{ steps.context.outputs.region }}
+          SERVICE_NAME: ${{ steps.context.outputs.service_name }}
+          SERVICE_EXISTS: ${{ steps.service.outputs.exists }}
+          IMAGE_REF: ${{ steps.context.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          DEPLOY_SA: ${{ steps.context.outputs.deploy_service_account }}
+          RUNTIME_SA: ${{ steps.perms.outputs.effective_runtime_sa }}
+          CONFIG_FILE: ${{ steps.config.outputs.config_file }}
+          REVISION_TAG: ${{ steps.revision_tag.outputs.revision_tag }}
+        run: |
+          set -euo pipefail
+
+          RESULTS="${RUNNER_TEMP}/preflight-results.tsv"
+          if [[ ! -f "$RESULTS" ]]; then : > "$RESULTS"; fi
+
+          FAILS="$(grep -c '^FAIL|' "$RESULTS" || true)"
+          WARNS="$(grep -c '^WARN|' "$RESULTS" || true)"
+          PASSES="$(grep -c '^PASS|' "$RESULTS" || true)"
+          FAILS="${FAILS:-0}"
+          WARNS="${WARNS:-0}"
+          PASSES="${PASSES:-0}"
+
+          RESULT="passed"
+          if (( FAILS > 0 )) || [[ "$JOB_STATUS" != "success" ]]; then
+            RESULT="failed"
+          fi
+
+          {
+            echo "result=${RESULT}"
+            echo "checks_failed=${FAILS}"
+            echo "checks_warned=${WARNS}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Validação Cloud Run — ${ENVIRONMENT_NAME}"
+            echo
+            if [[ "$RESULT" == "passed" ]]; then
+              echo "**✅ Apto para deploy** — ${PASSES} ok, ${WARNS} aviso(s), ${FAILS} falha(s). *Nada foi implantado.*"
+            else
+              echo "**❌ Não apto para deploy** — ${PASSES} ok, ${WARNS} aviso(s), ${FAILS} falha(s). *Nada foi implantado.*"
+            fi
+            echo
+            echo "| Item | Valor |"
+            echo "|---|---|"
+            echo "| Projeto Cloud Run | \`${PROJECT_ID:-n/a}\` |"
+            echo "| Região | \`${REGION:-n/a}\` |"
+            echo "| Serviço | \`${SERVICE_NAME:-n/a}\` (existe: \`${SERVICE_EXISTS:-n/a}\`) |"
+            echo "| Imagem | \`${IMAGE_REF:-n/a}\` |"
+            echo "| Digest resolvido | \`${IMAGE_DIGEST:-n/a}\` |"
+            echo "| SA de deploy | \`${DEPLOY_SA:-n/a}\` |"
+            echo "| SA de runtime | \`${RUNTIME_SA:-n/a}\` |"
+            echo "| Config | \`${CONFIG_FILE:-n/a}\` |"
+            echo "| Revision tag (PRD) | \`${REVISION_TAG:-n/a}\` |"
+            echo "| Status do job | \`${JOB_STATUS}\` |"
+            echo
+            echo "### Checks"
+            echo
+            echo "| | Check | Detalhe |"
+            echo "|---|---|---|"
+            while IFS='|' read -r status check detail; do
+              case "$status" in
+                PASS) icon="✅" ;;
+                WARN) icon="⚠️" ;;
+                FAIL) icon="❌" ;;
+                *) icon="ℹ️" ;;
+              esac
+              echo "| ${icon} | ${check} | ${detail} |"
+            done < "$RESULTS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( FAILS > 0 )); then
+            echo "::error::Validação reprovada: ${FAILS} check(s) com falha. Veja o resumo do job."
+            exit 1
+          fi
